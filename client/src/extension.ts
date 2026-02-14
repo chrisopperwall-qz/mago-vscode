@@ -38,6 +38,22 @@ let outputChannel: OutputChannel | undefined;
 // Map to store issues by key (filePath:line:col:code) for code actions
 const issueMap = new Map<string, MagoIssue>();
 
+// Per-category issue storage so watch mode can update analyze issues independently
+let lintIssues: MagoIssue[] = [];
+let analyzeIssues: MagoIssue[] = [];
+let guardIssues: MagoIssue[] = [];
+
+// Watch mode state
+let watchProcess: ChildProcess | undefined;
+let watchJsonBuffer = '';
+let watchBraceDepth = 0;
+let watchInString = false;
+let watchEscapeNext = false;
+let receivedJsonSinceReanalyzing = false;
+let watchFailureCount = 0;
+let watchDisabledForSession = false;
+let watchRestartTimer: ReturnType<typeof setTimeout> | undefined;
+
 interface MagoSpan {
   file_id: {
     name: string;
@@ -576,10 +592,49 @@ export function activate(context: ExtensionContext) {
     );
   }
 
+  // Start watch mode if configured
+  const analyzeWatchMode = config.get<boolean>('analyzeWatchMode', true);
+  const enableAnalyze = config.get<boolean>('enableAnalyze', true);
+  if (analyzeWatchMode && enableAnalyze) {
+    // Small delay to let workspace fully initialize
+    setTimeout(() => startWatchMode(), 500);
+  }
+
+  // Listen for config changes that affect watch mode
+  context.subscriptions.push(
+    workspace.onDidChangeConfiguration((e) => {
+      const watchConfigKeys = [
+        'mago.analyzeWatchMode',
+        'mago.enableAnalyze',
+        'mago.binPath',
+        'mago.binCommand',
+        'mago.workspace',
+        'mago.configFile',
+        'mago.phpVersion',
+        'mago.threads',
+        'mago.useBaselines',
+        'mago.analysisBaseline',
+        'mago.minimumReportLevel',
+      ];
+      const affected = watchConfigKeys.some(key => e.affectsConfiguration(key));
+      if (affected) {
+        const updatedConfig = workspace.getConfiguration('mago');
+        const watchEnabled = updatedConfig.get<boolean>('analyzeWatchMode', true);
+        const analyzeEnabled = updatedConfig.get<boolean>('enableAnalyze', true);
+        if (watchEnabled && analyzeEnabled) {
+          restartWatchMode();
+        } else {
+          stopWatchMode();
+        }
+      }
+    })
+  );
+
   // Scan on open if configured
   const scanOnOpen = config.get<boolean>('scanOnOpen', true);
   if (scanOnOpen) {
     // Wait a bit for workspace to be fully ready, then scan
+    // Watch mode handles analyze, so scanProject will skip analyze if watch is active
     setTimeout(async () => {
       const workspaceFolder = workspace.workspaceFolders?.[0];
       if (workspaceFolder) {
@@ -596,6 +651,7 @@ export function activate(context: ExtensionContext) {
 }
 
 export function deactivate(): void {
+  stopWatchMode();
   if (runningProcess) {
     runningProcess.kill();
     runningProcess = undefined;
@@ -612,16 +668,14 @@ async function scanFile(document: TextDocument): Promise<void> {
   }
 
   updateStatusBar('running');
-  
+
   try {
     const config = workspace.getConfiguration('mago');
     const enableLint = config.get<boolean>('enableLint', true);
     const enableAnalyze = config.get<boolean>('enableAnalyze', true);
     const enableGuard = config.get<boolean>('enableGuard', false);
     const useBaselines = config.get<boolean>('useBaselines', false);
-    
-    const allIssues: MagoIssue[] = [];
-    
+
     // Run lint if enabled
     if (enableLint) {
       try {
@@ -635,18 +689,15 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         lintArgs.push(document.uri.fsPath);
         const lintResult = await runMago(lintArgs);
-        if (lintResult && lintResult.issues) {
-          // Tag issues with category
-          const taggedIssues = lintResult.issues.map(issue => ({ ...issue, category: 'lint' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (lintResult?.issues || []).map(issue => ({ ...issue, category: 'lint' as const }));
+        updateCategoryIssues('lint', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Lint failed: ${error}`);
       }
     }
-    
-    // Run analyze if enabled
-    if (enableAnalyze) {
+
+    // Run analyze if enabled (skip if watch mode is active)
+    if (enableAnalyze && !watchProcess) {
       try {
         const analyzeArgs = ['analyze', '--reporting-format', 'json'];
         if (useBaselines) {
@@ -658,16 +709,13 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         analyzeArgs.push(document.uri.fsPath);
         const analyzeResult = await runMago(analyzeArgs);
-        if (analyzeResult && analyzeResult.issues) {
-          // Tag issues with category
-          const taggedIssues = analyzeResult.issues.map(issue => ({ ...issue, category: 'analysis' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (analyzeResult?.issues || []).map(issue => ({ ...issue, category: 'analysis' as const }));
+        updateCategoryIssues('analysis', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Analyze failed: ${error}`);
       }
     }
-    
+
     // Run guard if enabled
     if (enableGuard) {
       try {
@@ -681,19 +729,11 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         guardArgs.push(document.uri.fsPath);
         const guardResult = await runMago(guardArgs);
-        if (guardResult && guardResult.issues) {
-          // Tag issues with category
-          const taggedIssues = guardResult.issues.map(issue => ({ ...issue, category: 'guard' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (guardResult?.issues || []).map(issue => ({ ...issue, category: 'guard' as const }));
+        updateCategoryIssues('guard', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Guard failed: ${error}`);
       }
-    }
-    
-    // Update diagnostics with merged results (only if at least one command is enabled)
-    if (enableLint || enableAnalyze || enableGuard) {
-      updateDiagnostics({ issues: allIssues });
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to scan file - ${error}`);
@@ -721,9 +761,7 @@ async function scanProject(): Promise<void> {
     const enableAnalyze = config.get<boolean>('enableAnalyze', true);
     const enableGuard = config.get<boolean>('enableGuard', false);
     const useBaselines = config.get<boolean>('useBaselines', false);
-    
-    const allIssues: MagoIssue[] = [];
-    
+
     // Run lint if enabled
     if (enableLint) {
       try {
@@ -735,18 +773,15 @@ async function scanProject(): Promise<void> {
           lintArgs.push('--baseline', baselinePath);
         }
         const lintResult = await runMago(lintArgs);
-        if (lintResult && lintResult.issues) {
-          // Tag issues with category
-          const taggedIssues = lintResult.issues.map(issue => ({ ...issue, category: 'lint' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (lintResult?.issues || []).map(issue => ({ ...issue, category: 'lint' as const }));
+        updateCategoryIssues('lint', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Lint failed: ${error}`);
       }
     }
-    
-    // Run analyze if enabled
-    if (enableAnalyze) {
+
+    // Run analyze if enabled (skip if watch mode is active)
+    if (enableAnalyze && !watchProcess) {
       try {
         const analyzeArgs = ['analyze', '--reporting-format', 'json'];
         if (useBaselines) {
@@ -756,16 +791,13 @@ async function scanProject(): Promise<void> {
           analyzeArgs.push('--baseline', baselinePath);
         }
         const analyzeResult = await runMago(analyzeArgs);
-        if (analyzeResult && analyzeResult.issues) {
-          // Tag issues with category
-          const taggedIssues = analyzeResult.issues.map(issue => ({ ...issue, category: 'analysis' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (analyzeResult?.issues || []).map(issue => ({ ...issue, category: 'analysis' as const }));
+        updateCategoryIssues('analysis', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Analyze failed: ${error}`);
       }
     }
-    
+
     // Run guard if enabled
     if (enableGuard) {
       try {
@@ -777,19 +809,11 @@ async function scanProject(): Promise<void> {
           guardArgs.push('--baseline', baselinePath);
         }
         const guardResult = await runMago(guardArgs);
-        if (guardResult && guardResult.issues) {
-          // Tag issues with category
-          const taggedIssues = guardResult.issues.map(issue => ({ ...issue, category: 'guard' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (guardResult?.issues || []).map(issue => ({ ...issue, category: 'guard' as const }));
+        updateCategoryIssues('guard', taggedIssues);
       } catch (error) {
         outputChannel?.appendLine(`[WARN] Guard failed: ${error}`);
       }
-    }
-    
-    // Update diagnostics with merged results (only if at least one command is enabled)
-    if (enableLint || enableAnalyze || enableGuard) {
-      updateDiagnostics({ issues: allIssues });
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to scan project - ${error}`);
@@ -1164,6 +1188,16 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
       reject(new Error(`Failed to spawn Mago: ${error.message}`));
     });
   });
+}
+
+function updateCategoryIssues(category: 'lint' | 'analysis' | 'guard', issues: MagoIssue[]): void {
+  switch (category) {
+    case 'lint': lintIssues = issues; break;
+    case 'analysis': analyzeIssues = issues; break;
+    case 'guard': guardIssues = issues; break;
+  }
+  const allIssues = [...lintIssues, ...analyzeIssues, ...guardIssues];
+  updateDiagnostics({ issues: allIssues });
 }
 
 function updateDiagnostics(result: MagoResult): void {
@@ -1783,6 +1817,263 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
       reject(new Error(`Failed to spawn Mago: ${error.message}`));
     });
   });
+}
+
+function buildWatchArgs(): string[] {
+  const config = workspace.getConfiguration('mago');
+  const workspaceFolder = workspace.workspaceFolders?.[0];
+  const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
+  const useBaselines = config.get<boolean>('useBaselines', false);
+
+  const args = ['analyze', '--watch', '--reporting-format', 'json'];
+
+  if (useBaselines) {
+    const analysisBaseline = config.get<string>('analysisBaseline', 'analysis-baseline.toml');
+    const baselinePath = resolvePath(analysisBaseline, workspaceRoot);
+    args.push('--baseline', baselinePath);
+  }
+
+  const minReportLevel = config.get<string>('minimumReportLevel', 'error');
+  if (minReportLevel) {
+    args.push('--minimum-report-level', minReportLevel);
+  }
+
+  return args;
+}
+
+function startWatchMode(): void {
+  if (watchProcess || watchDisabledForSession) {
+    return;
+  }
+
+  const config = workspace.getConfiguration('mago');
+  const enableAnalyze = config.get<boolean>('enableAnalyze', true);
+  const watchModeEnabled = config.get<boolean>('analyzeWatchMode', true);
+
+  if (!enableAnalyze || !watchModeEnabled) {
+    return;
+  }
+
+  const workspaceFolder = workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    return;
+  }
+
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+
+  let binPath = config.get<string>('binPath', 'mago');
+  const binCommand = config.get<string[]>('binCommand');
+
+  // Auto-discover Mago binary
+  if (!binCommand || binCommand.length === 0 || !binCommand[0]) {
+    if (!binPath || binPath.trim() === '' || binPath.trim() === 'mago') {
+      const discoveredPath = findMagoBinary(workspaceRoot);
+      if (discoveredPath) {
+        binPath = discoveredPath;
+      }
+    }
+  }
+
+  // Build command
+  let command: string[];
+  if (binCommand && Array.isArray(binCommand) && binCommand.length > 0 && binCommand[0]) {
+    command = binCommand
+      .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
+      .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
+    if (command.length === 0) {
+      outputChannel?.appendLine('[ERROR] Watch mode: binCommand is set but contains no valid commands.');
+      return;
+    }
+  } else {
+    const resolvedPath = binPath || 'mago';
+    if (!resolvedPath || typeof resolvedPath !== 'string' || !resolvedPath.trim()) {
+      outputChannel?.appendLine('[ERROR] Watch mode: No valid mago binary path.');
+      return;
+    }
+    command = [resolvePath(resolvedPath.trim(), workspaceRoot)];
+  }
+
+  const executable = command[0];
+  if (!executable || typeof executable !== 'string' || !executable.trim()) {
+    outputChannel?.appendLine('[ERROR] Watch mode: Invalid mago executable.');
+    return;
+  }
+
+  // Build top-level args
+  const topLevelArgs: string[] = [];
+  topLevelArgs.push('--workspace', workspaceRoot);
+
+  const configFile = config.get<string>('configFile');
+  if (configFile) {
+    topLevelArgs.push('--config', configFile);
+  }
+
+  const phpVersion = config.get<string>('phpVersion');
+  if (phpVersion) {
+    topLevelArgs.push('--php-version', phpVersion);
+  }
+
+  const threads = config.get<number>('threads');
+  if (threads) {
+    topLevelArgs.push('--threads', threads.toString());
+  }
+
+  const subcommandArgs = buildWatchArgs();
+  const fullArgs = [...command.slice(1), ...topLevelArgs, ...subcommandArgs];
+
+  outputChannel?.appendLine(`[INFO] Starting watch mode: ${executable} ${fullArgs.join(' ')}`);
+
+  // Reset JSON parser state
+  watchJsonBuffer = '';
+  watchBraceDepth = 0;
+  watchInString = false;
+  watchEscapeNext = false;
+  receivedJsonSinceReanalyzing = false;
+
+  let stderrLineBuffer = '';
+
+  const proc = spawn(executable, fullArgs, {
+    cwd: workspaceRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  watchProcess = proc;
+
+  proc.stdout.on('data', (data: Buffer) => {
+    const chunk = data.toString();
+    for (const char of chunk) {
+      watchJsonBuffer += char;
+
+      if (watchEscapeNext) {
+        watchEscapeNext = false;
+        continue;
+      }
+
+      if (char === '\\' && watchInString) {
+        watchEscapeNext = true;
+        continue;
+      }
+
+      if (char === '"') {
+        watchInString = !watchInString;
+        continue;
+      }
+
+      if (!watchInString) {
+        if (char === '{') {
+          watchBraceDepth++;
+        } else if (char === '}') {
+          watchBraceDepth--;
+          if (watchBraceDepth === 0) {
+            // Complete JSON document
+            try {
+              const result = JSON.parse(watchJsonBuffer);
+              const taggedIssues = (result.issues || []).map(
+                (issue: MagoIssue) => ({ ...issue, category: 'analysis' as const })
+              );
+              updateCategoryIssues('analysis', taggedIssues);
+              receivedJsonSinceReanalyzing = true;
+            } catch (e) {
+              outputChannel?.appendLine(`[ERROR] Watch mode JSON parse error: ${e}`);
+            }
+            watchJsonBuffer = '';
+          }
+        }
+      }
+    }
+  });
+
+  proc.stderr.on('data', (data: Buffer) => {
+    stderrLineBuffer += data.toString();
+    const lines = stderrLineBuffer.split('\n');
+    // Keep the last (possibly incomplete) line in the buffer
+    stderrLineBuffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.trim()) {
+        outputChannel?.appendLine(`[WATCH] ${line}`);
+      }
+      if (line.includes('re-analyzing')) {
+        receivedJsonSinceReanalyzing = false;
+        updateStatusBar('running', 'Mago watch: re-analyzing...');
+      } else if (line.includes('Analysis complete')) {
+        if (!receivedJsonSinceReanalyzing) {
+          updateCategoryIssues('analysis', []);
+        }
+        updateStatusBar('idle');
+      }
+    }
+  });
+
+  proc.on('close', (code) => {
+    outputChannel?.appendLine(`[INFO] Watch process exited with code: ${code}`);
+    watchProcess = undefined;
+
+    // Auto-restart with backoff on crash
+    if (code !== 0 && code !== null) {
+      watchFailureCount++;
+      if (watchFailureCount >= 3) {
+        watchDisabledForSession = true;
+        outputChannel?.appendLine('[WARN] Watch mode disabled for this session after 3 consecutive failures.');
+        window.showWarningMessage('Mago: Watch mode disabled after repeated failures. Falling back to one-shot analysis on save.');
+        updateStatusBar('error', 'Mago watch mode disabled');
+        return;
+      }
+      const delay = 5000 * watchFailureCount;
+      outputChannel?.appendLine(`[INFO] Restarting watch mode in ${delay}ms...`);
+      watchRestartTimer = setTimeout(() => {
+        startWatchMode();
+      }, delay);
+    } else {
+      // Clean exit (e.g., killed by stopWatchMode) — reset failure count
+      watchFailureCount = 0;
+    }
+  });
+
+  proc.on('error', (error) => {
+    outputChannel?.appendLine(`[ERROR] Watch process error: ${error.message}`);
+    watchProcess = undefined;
+
+    watchFailureCount++;
+    if (watchFailureCount >= 3) {
+      watchDisabledForSession = true;
+      outputChannel?.appendLine('[WARN] Watch mode disabled for this session after 3 consecutive failures.');
+      window.showWarningMessage('Mago: Watch mode disabled after repeated failures. Falling back to one-shot analysis on save.');
+      updateStatusBar('error', 'Mago watch mode disabled');
+      return;
+    }
+    const delay = 5000 * watchFailureCount;
+    outputChannel?.appendLine(`[INFO] Restarting watch mode in ${delay}ms...`);
+    watchRestartTimer = setTimeout(() => {
+      startWatchMode();
+    }, delay);
+  });
+
+  outputChannel?.appendLine('[INFO] Watch mode started.');
+}
+
+function stopWatchMode(): void {
+  if (watchRestartTimer) {
+    clearTimeout(watchRestartTimer);
+    watchRestartTimer = undefined;
+  }
+  if (watchProcess) {
+    outputChannel?.appendLine('[INFO] Stopping watch mode...');
+    watchProcess.kill();
+    watchProcess = undefined;
+  }
+  // Reset parser state
+  watchJsonBuffer = '';
+  watchBraceDepth = 0;
+  watchInString = false;
+  watchEscapeNext = false;
+}
+
+function restartWatchMode(): void {
+  stopWatchMode();
+  watchFailureCount = 0;
+  watchDisabledForSession = false;
+  startWatchMode();
 }
 
 function updateStatusBar(status: 'running' | 'idle' | 'error', message?: string): void {

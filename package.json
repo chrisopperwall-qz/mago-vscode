@@ -65,6 +65,11 @@
           "default": true,
           "description": "Enable static analysis"
         },
+        "mago.analyzeWatchMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use watch mode for continuous analysis. When enabled, mago analyze runs as a persistent background process with incremental re-analysis on file changes, instead of running on each file save."
+        },
         "mago.runOnSave": {
           "type": "boolean",
           "default": true,
