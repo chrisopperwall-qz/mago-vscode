@@ -53,6 +53,11 @@ let receivedJsonSinceReanalyzing = false;
 let watchFailureCount = 0;
 let watchDisabledForSession = false;
 let watchRestartTimer: ReturnType<typeof setTimeout> | undefined;
+let watchClearTimer: ReturnType<typeof setTimeout> | undefined;
+// When we repair incomplete JSON by appending closing delimiters, the actual
+// bytes are still in mago's pipe buffer. They'll arrive at the start of the
+// next stdout data chunk. We track how many to skip so the parser stays in sync.
+let watchSkipBytes = 0;
 
 interface MagoSpan {
   file_id: {
@@ -1191,12 +1196,14 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
 }
 
 function updateCategoryIssues(category: 'lint' | 'analysis' | 'guard', issues: MagoIssue[]): void {
+  outputChannel?.appendLine(`[DEBUG] updateCategoryIssues('${category}', ${issues.length} issues). Current counts: lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length}`);
   switch (category) {
     case 'lint': lintIssues = issues; break;
     case 'analysis': analyzeIssues = issues; break;
     case 'guard': guardIssues = issues; break;
   }
   const allIssues = [...lintIssues, ...analyzeIssues, ...guardIssues];
+  outputChannel?.appendLine(`[DEBUG] Merging all categories: total ${allIssues.length} issues (lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length})`);
   updateDiagnostics({ issues: allIssues });
 }
 
@@ -1928,6 +1935,7 @@ function startWatchMode(): void {
   watchBraceDepth = 0;
   watchInString = false;
   watchEscapeNext = false;
+  watchSkipBytes = 0;
   receivedJsonSinceReanalyzing = false;
 
   let stderrLineBuffer = '';
@@ -1940,7 +1948,14 @@ function startWatchMode(): void {
   watchProcess = proc;
 
   proc.stdout.on('data', (data: Buffer) => {
-    const chunk = data.toString();
+    let chunk = data.toString();
+    // Skip bytes that were already consumed via JSON repair
+    if (watchSkipBytes > 0) {
+      outputChannel?.appendLine(`[WATCH:stdout] Skipping ${watchSkipBytes} bytes (already consumed via repair)`);
+      chunk = chunk.substring(watchSkipBytes);
+      watchSkipBytes = 0;
+    }
+    outputChannel?.appendLine(`[WATCH:stdout] Received ${chunk.length} chars: ${chunk.substring(0, 500)}${chunk.length > 500 ? '...(truncated)' : ''}`);
     for (const char of chunk) {
       watchJsonBuffer += char;
 
@@ -1968,19 +1983,32 @@ function startWatchMode(): void {
             // Complete JSON document
             try {
               const result = JSON.parse(watchJsonBuffer);
-              const taggedIssues = (result.issues || []).map(
+              outputChannel?.appendLine(`[WATCH:parsed] Complete JSON document. Top-level keys: ${Object.keys(result).join(', ')}`);
+              const issues = result.issues || [];
+              outputChannel?.appendLine(`[WATCH:parsed] Issue count: ${issues.length}`);
+              if (issues.length > 0) {
+                outputChannel?.appendLine(`[WATCH:parsed] First issue: ${JSON.stringify(issues[0]).substring(0, 300)}`);
+              }
+              const taggedIssues = issues.map(
                 (issue: MagoIssue) => ({ ...issue, category: 'analysis' as const })
               );
-              updateCategoryIssues('analysis', taggedIssues);
               receivedJsonSinceReanalyzing = true;
+              // Cancel any pending clear timer — JSON arrived before the delay
+              if (watchClearTimer) {
+                clearTimeout(watchClearTimer);
+                watchClearTimer = undefined;
+              }
+              updateCategoryIssues('analysis', taggedIssues);
             } catch (e) {
               outputChannel?.appendLine(`[ERROR] Watch mode JSON parse error: ${e}`);
+              outputChannel?.appendLine(`[ERROR] Buffer content (first 500 chars): ${watchJsonBuffer.substring(0, 500)}`);
             }
             watchJsonBuffer = '';
           }
         }
       }
     }
+    outputChannel?.appendLine(`[WATCH:state] After chunk: depth=${watchBraceDepth}, inString=${watchInString}, escape=${watchEscapeNext}, bufLen=${watchJsonBuffer.length}`);
   });
 
   proc.stderr.on('data', (data: Buffer) => {
@@ -1995,10 +2023,69 @@ function startWatchMode(): void {
       }
       if (line.includes('re-analyzing')) {
         receivedJsonSinceReanalyzing = false;
+        outputChannel?.appendLine(`[WATCH:state] Re-analyzing detected, reset receivedJsonSinceReanalyzing=false`);
         updateStatusBar('running', 'Mago watch: re-analyzing...');
-      } else if (line.includes('Analysis complete')) {
+      } else if (line.toLowerCase().includes('analysis complete')) {
+        outputChannel?.appendLine(`[WATCH:state] Analysis complete. receivedJsonSinceReanalyzing=${receivedJsonSinceReanalyzing}, bufLen=${watchJsonBuffer.length}, depth=${watchBraceDepth}`);
+
+        // Mago doesn't flush stdout after analysis, so the final closing
+        // delimiter(s) can be stuck in its stdio pipe buffer. If we have a
+        // large pending buffer at depth > 0 (and we're not mid-string), try
+        // to complete the JSON ourselves.
+        if (watchJsonBuffer.length > 0 && watchBraceDepth > 0 && !watchInString) {
+          outputChannel?.appendLine(`[WATCH:repair] Attempting to repair incomplete JSON (depth=${watchBraceDepth}, bufLen=${watchJsonBuffer.length})`);
+          const closingBraces = '}'.repeat(watchBraceDepth);
+          // Try common suffixes — the most likely case is just the outermost
+          // closing brace, but arrays may also be unclosed.
+          const attempts = [closingBraces, ']' + closingBraces, ']]' + closingBraces];
+          let repaired = false;
+          for (const suffix of attempts) {
+            try {
+              const result = JSON.parse(watchJsonBuffer + suffix);
+              const issues = result.issues || [];
+              outputChannel?.appendLine(`[WATCH:repair] Success with suffix '${suffix}'. Issue count: ${issues.length}`);
+              const taggedIssues = issues.map(
+                (issue: MagoIssue) => ({ ...issue, category: 'analysis' as const })
+              );
+              receivedJsonSinceReanalyzing = true;
+              if (watchClearTimer) {
+                clearTimeout(watchClearTimer);
+                watchClearTimer = undefined;
+              }
+              updateCategoryIssues('analysis', taggedIssues);
+              // The actual bytes will arrive at the start of the next stdout
+              // chunk (when the next analysis flushes the pipe buffer). Skip
+              // them so the parser doesn't go out of sync.
+              watchSkipBytes = suffix.length;
+              repaired = true;
+              break;
+            } catch {
+              continue;
+            }
+          }
+          if (!repaired) {
+            outputChannel?.appendLine(`[WATCH:repair] Failed. Last 200 chars of buffer: ${watchJsonBuffer.slice(-200)}`);
+          }
+          // Reset parser state for the next analysis cycle
+          watchJsonBuffer = '';
+          watchBraceDepth = 0;
+          watchInString = false;
+          watchEscapeNext = false;
+        }
+
         if (!receivedJsonSinceReanalyzing) {
-          updateCategoryIssues('analysis', []);
+          // Delay clearing to handle the race where stderr (line-buffered) arrives
+          // before stdout (pipe-buffered) has delivered the JSON data
+          if (watchClearTimer) {
+            clearTimeout(watchClearTimer);
+          }
+          watchClearTimer = setTimeout(() => {
+            watchClearTimer = undefined;
+            if (!receivedJsonSinceReanalyzing) {
+              outputChannel?.appendLine(`[WATCH:state] No JSON received after delay, clearing analyze issues`);
+              updateCategoryIssues('analysis', []);
+            }
+          }, 200);
         }
         updateStatusBar('idle');
       }
@@ -2053,6 +2140,10 @@ function startWatchMode(): void {
 }
 
 function stopWatchMode(): void {
+  if (watchClearTimer) {
+    clearTimeout(watchClearTimer);
+    watchClearTimer = undefined;
+  }
   if (watchRestartTimer) {
     clearTimeout(watchRestartTimer);
     watchRestartTimer = undefined;
@@ -2067,6 +2158,7 @@ function stopWatchMode(): void {
   watchBraceDepth = 0;
   watchInString = false;
   watchEscapeNext = false;
+  watchSkipBytes = 0;
 }
 
 function restartWatchMode(): void {

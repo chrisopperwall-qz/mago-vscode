@@ -1,8 +1,8 @@
 {
   "name": "mago-vscode",
-  "displayName": "Mago",
+  "displayName": "Mago Testing",
   "description": "Mago integration for VSCode",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "publisher": "Michael4d45",
   "license": "MIT",
   "repository": {
@@ -27,7 +27,7 @@
   "main": "./out/client/src/extension.js",
   "contributes": {
     "configuration": {
-      "title": "Mago",
+      "title": "Mago Testing",
       "properties": {
         "mago.enabled": {
           "type": "boolean",
@@ -307,21 +307,21 @@
         {
           "command": "mago.lintFixUnsafe"
         },
-      {
-        "command": "mago.lintFixPotentiallyUnsafe"
-      },
-      {
-        "command": "mago.lintFixFile",
-        "when": "resourceExtname == .php"
-      },
-      {
-        "command": "mago.lintFixFileUnsafe",
-        "when": "resourceExtname == .php"
-      },
-      {
-        "command": "mago.lintFixFilePotentiallyUnsafe",
-        "when": "resourceExtname == .php"
-      },
+        {
+          "command": "mago.lintFixPotentiallyUnsafe"
+        },
+        {
+          "command": "mago.lintFixFile",
+          "when": "resourceExtname == .php"
+        },
+        {
+          "command": "mago.lintFixFileUnsafe",
+          "when": "resourceExtname == .php"
+        },
+        {
+          "command": "mago.lintFixFilePotentiallyUnsafe",
+          "when": "resourceExtname == .php"
+        },
         {
           "command": "mago.addFormatIgnoreNext",
           "when": "resourceExtname == .php"
@@ -374,13 +374,11 @@
     "test": "node ./client/out/test/runTest.js",
     "package": "vsce package"
   },
-  "dependencies": {},
   "devDependencies": {
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.90.0",
     "tsc-alias": "^1.8.16",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vsce": "^2.15.0"
   }
 }
-
-
