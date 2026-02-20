@@ -1467,11 +1467,22 @@ function updateDiagnostics(result: MagoResult): void {
     diagnosticsMap.get(filePath)!.push(diagnostic);
   }
 
-  // Update diagnostics collection
-  diagnosticCollection.clear();
+  // Update diagnostics collection without clearing first to avoid a flash
+  // where the problem count drops to zero before being repopulated.
+  // 1. Collect URIs that currently have diagnostics
+  const previousUris = new Set<string>();
+  diagnosticCollection.forEach((uri) => previousUris.add(uri.toString()));
+
+  // 2. Set new diagnostics per file (overwrites existing entries)
   for (const [filePath, diagnostics] of diagnosticsMap) {
     const uri = Uri.file(filePath);
     diagnosticCollection.set(uri, diagnostics);
+    previousUris.delete(uri.toString());
+  }
+
+  // 3. Clear diagnostics for files that no longer have issues
+  for (const uriStr of previousUris) {
+    diagnosticCollection.set(Uri.parse(uriStr), []);
   }
 }
 
