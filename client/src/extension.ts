@@ -1467,23 +1467,23 @@ function updateDiagnostics(result: MagoResult): void {
     diagnosticsMap.get(filePath)!.push(diagnostic);
   }
 
-  // Update diagnostics collection without clearing first to avoid a flash
-  // where the problem count drops to zero before being repopulated.
-  // 1. Collect URIs that currently have diagnostics
+  // Update diagnostics collection with a single batch set call
+  // to avoid flicker in VSCode UI.
+  const entries: [Uri, Diagnostic[] | undefined][] = [];
   const previousUris = new Set<string>();
-  diagnosticCollection.forEach((uri) => previousUris.add(uri.toString()));
+  diagnosticCollection.forEach(uri => previousUris.add(uri.toString()));
 
-  // 2. Set new diagnostics per file (overwrites existing entries)
   for (const [filePath, diagnostics] of diagnosticsMap) {
     const uri = Uri.file(filePath);
-    diagnosticCollection.set(uri, diagnostics);
+    entries.push([uri, diagnostics]);
     previousUris.delete(uri.toString());
   }
 
-  // 3. Clear diagnostics for files that no longer have issues
   for (const uriStr of previousUris) {
-    diagnosticCollection.set(Uri.parse(uriStr), []);
+    entries.push([Uri.parse(uriStr), undefined]);
   }
+
+  diagnosticCollection.set(entries);
 }
 
 // Helper to convert byte offset to column
