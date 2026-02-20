@@ -1231,11 +1231,20 @@ function updateDiagnostics(result: MagoResult): void {
   }
 
   // Update diagnostics collection
-  diagnosticCollection.clear();
+  // To avoid momentarily clearing all entries in the Problems tab,
+  // set all new uris on diagnosticCollection (overwriting existing uris) and
+  // then remove any Uris from the previous iteration that were not present
+  // in the new diagnostics.
+  const diagnosticUrisToRemove = new Set<string>();
+  diagnosticCollection.forEach(uri => diagnosticUrisToRemove.add(uri.toString()))
+
   for (const [filePath, diagnostics] of diagnosticsMap) {
     const uri = Uri.file(filePath);
     diagnosticCollection.set(uri, diagnostics);
+    diagnosticUrisToRemove.delete(uri.toString())
   }
+
+  diagnosticUrisToRemove.forEach(uri => diagnosticCollection.delete)
 }
 
 // Helper to convert byte offset to column
