@@ -1,35 +1,34 @@
-import { spawn, ChildProcess } from 'child_process';
+import { COMMANDS } from '@shared/commands/defs';
+import { ChildProcess, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  ExtensionContext,
-  workspace,
-  commands,
-  window,
-  StatusBarAlignment,
-  StatusBarItem,
-  languages,
+  CancellationToken,
+  CodeAction,
+  CodeActionContext,
+  CodeActionKind,
+  CodeActionProvider,
   Diagnostic,
   DiagnosticSeverity,
-  Range,
-  Uri,
-  TextDocument,
-  OutputChannel,
-  TextEdit,
-  WorkspaceEdit,
   DocumentFormattingEditProvider,
+  ExtensionContext,
   FormattingOptions,
-  CancellationToken,
-  CodeActionProvider,
-  CodeAction,
-  CodeActionKind,
-  Position,
-  CodeActionContext,
-  MarkdownString,
   Hover,
-  Selection,
+  MarkdownString,
+  OutputChannel,
+  Position,
+  Range,
+  StatusBarAlignment,
+  StatusBarItem,
+  TextDocument,
+  TextEdit,
+  Uri,
+  WorkspaceEdit,
+  commands,
+  languages,
+  window,
+  workspace,
 } from 'vscode';
-import { COMMANDS } from '@shared/commands/defs';
 
 let diagnosticCollection = languages.createDiagnosticCollection('mago');
 let statusBarItem: StatusBarItem | undefined;
@@ -37,6 +36,29 @@ let runningProcess: ChildProcess | undefined;
 let outputChannel: OutputChannel | undefined;
 // Map to store issues by key (filePath:line:col:code) for code actions
 const issueMap = new Map<string, MagoIssue>();
+
+// Per-category issue storage so watch mode can update analyze issues independently
+let lintIssues: MagoIssue[] = [];
+let analyzeIssues: MagoIssue[] = [];
+let guardIssues: MagoIssue[] = [];
+
+// Watch mode state
+let watchProcess: ChildProcess | undefined;
+let watchJsonBuffer = '';
+let watchBraceDepth = 0;
+let watchInString = false;
+let watchEscapeNext = false;
+let receivedJsonSinceReanalyzing = false;
+let watchFailureCount = 0;
+let watchDisabledForSession = false;
+let watchRestartTimer: ReturnType<typeof setTimeout> | undefined;
+let watchClearTimer: ReturnType<typeof setTimeout> | undefined;
+
+function log(message: string): void {
+  const now = new Date();
+  const ts = now.toISOString().slice(11, 23); // HH:mm:ss.mmm
+  outputChannel?.appendLine(`[${ts}] ${message}`);
+}
 
 interface MagoSpan {
   file_id: {
@@ -64,7 +86,7 @@ interface MagoAnnotation {
 interface MagoEdit {
   range: { start: number; end: number };
   new_text: string;
-  safety?: "safe" | "potentiallyunsafe" | "unsafe";
+  safety?: 'safe' | 'potentiallyunsafe' | 'unsafe';
 }
 
 interface MagoFileId {
@@ -93,13 +115,13 @@ interface MagoResult {
 export function activate(context: ExtensionContext) {
   // Create output channel for logging
   outputChannel = window.createOutputChannel('Mago');
-  outputChannel.appendLine('Mago extension activated');
+  log('Mago extension activated');
 
   const config = workspace.getConfiguration('mago');
   const enabled = config.get<boolean>('enabled', true);
 
   if (!enabled) {
-    outputChannel.appendLine('Mago extension is disabled');
+    log('Mago extension is disabled');
     return;
   }
 
@@ -185,7 +207,9 @@ export function activate(context: ExtensionContext) {
       if (activeEditor && activeEditor.document.languageId === 'php') {
         await lintFixFile(activeEditor.document, 'safe');
       } else {
-        window.showWarningMessage('Mago: Please open a PHP file to apply lint fixes.');
+        window.showWarningMessage(
+          'Mago: Please open a PHP file to apply lint fixes.'
+        );
       }
     }),
 
@@ -194,7 +218,9 @@ export function activate(context: ExtensionContext) {
       if (activeEditor && activeEditor.document.languageId === 'php') {
         await lintFixFile(activeEditor.document, 'unsafe');
       } else {
-        window.showWarningMessage('Mago: Please open a PHP file to apply lint fixes.');
+        window.showWarningMessage(
+          'Mago: Please open a PHP file to apply lint fixes.'
+        );
       }
     }),
 
@@ -203,22 +229,30 @@ export function activate(context: ExtensionContext) {
       if (activeEditor && activeEditor.document.languageId === 'php') {
         await lintFixFile(activeEditor.document, 'potentially-unsafe');
       } else {
-        window.showWarningMessage('Mago: Please open a PHP file to apply lint fixes.');
+        window.showWarningMessage(
+          'Mago: Please open a PHP file to apply lint fixes.'
+        );
       }
     }),
 
-    commands.registerCommand('mago.applyFix', async (issue: MagoIssue, uri: Uri) => {
-      await applyMagoFix(issue, uri);
-    }),
+    commands.registerCommand(
+      'mago.applyFix',
+      async (issue: MagoIssue, uri: Uri) => {
+        await applyMagoFix(issue, uri);
+      }
+    ),
 
-    commands.registerCommand('mago.addSuppression', async (
-      document: TextDocument,
-      line: number,
-      type: 'expect',
-      suppressionCode: string
-    ) => {
-      await addSuppression(document, line, type, suppressionCode);
-    }),
+    commands.registerCommand(
+      'mago.addSuppression',
+      async (
+        document: TextDocument,
+        line: number,
+        type: 'expect',
+        suppressionCode: string
+      ) => {
+        await addSuppression(document, line, type, suppressionCode);
+      }
+    ),
 
     commands.registerCommand('mago.addFormatIgnoreFile', async () => {
       const activeEditor = window.activeTextEditor;
@@ -229,58 +263,68 @@ export function activate(context: ExtensionContext) {
       await addFormatIgnoreFile(activeEditor.document);
     }),
 
-    commands.registerCommand('mago.addFormatIgnoreNext', async (document?: TextDocument, range?: Range) => {
-      let doc = document;
-      let selectionRange = range;
-      
-      // If not provided, get from active editor
-      if (!doc || !selectionRange) {
-        const activeEditor = window.activeTextEditor;
-        if (!activeEditor || activeEditor.document.languageId !== 'php') {
-          window.showWarningMessage('Mago: Please select text in a PHP file.');
-          return;
-        }
-        doc = activeEditor.document;
-        const selection = activeEditor.selection;
-        if (selection.isEmpty) {
-          window.showWarningMessage('Mago: Please select some text first.');
-          return;
-        }
-        selectionRange = new Range(selection.start, selection.end);
-      }
-      
-      await addFormatIgnoreNext(doc, selectionRange);
-    }),
+    commands.registerCommand(
+      'mago.addFormatIgnoreNext',
+      async (document?: TextDocument, range?: Range) => {
+        let doc = document;
+        let selectionRange = range;
 
-    commands.registerCommand('mago.addFormatIgnoreRegion', async (document?: TextDocument, range?: Range) => {
-      let doc = document;
-      let selectionRange = range;
-      
-      // If not provided, get from active editor
-      if (!doc || !selectionRange) {
-        const activeEditor = window.activeTextEditor;
-        if (!activeEditor || activeEditor.document.languageId !== 'php') {
-          window.showWarningMessage('Mago: Please select text in a PHP file.');
-          return;
+        // If not provided, get from active editor
+        if (!doc || !selectionRange) {
+          const activeEditor = window.activeTextEditor;
+          if (!activeEditor || activeEditor.document.languageId !== 'php') {
+            window.showWarningMessage(
+              'Mago: Please select text in a PHP file.'
+            );
+            return;
+          }
+          doc = activeEditor.document;
+          const selection = activeEditor.selection;
+          if (selection.isEmpty) {
+            window.showWarningMessage('Mago: Please select some text first.');
+            return;
+          }
+          selectionRange = new Range(selection.start, selection.end);
         }
-        doc = activeEditor.document;
-        const selection = activeEditor.selection;
-        if (selection.isEmpty) {
-          window.showWarningMessage('Mago: Please select some text first.');
-          return;
-        }
-        selectionRange = new Range(selection.start, selection.end);
-      }
-      
-      await addFormatIgnoreRegion(doc, selectionRange);
-    }),
 
-    commands.registerCommand('mago.disableRule', async (
-      category: string,
-      ruleCode: string
-    ) => {
-      await disableRuleInConfig(category, ruleCode);
-    }),
+        await addFormatIgnoreNext(doc, selectionRange);
+      }
+    ),
+
+    commands.registerCommand(
+      'mago.addFormatIgnoreRegion',
+      async (document?: TextDocument, range?: Range) => {
+        let doc = document;
+        let selectionRange = range;
+
+        // If not provided, get from active editor
+        if (!doc || !selectionRange) {
+          const activeEditor = window.activeTextEditor;
+          if (!activeEditor || activeEditor.document.languageId !== 'php') {
+            window.showWarningMessage(
+              'Mago: Please select text in a PHP file.'
+            );
+            return;
+          }
+          doc = activeEditor.document;
+          const selection = activeEditor.selection;
+          if (selection.isEmpty) {
+            window.showWarningMessage('Mago: Please select some text first.');
+            return;
+          }
+          selectionRange = new Range(selection.start, selection.end);
+        }
+
+        await addFormatIgnoreRegion(doc, selectionRange);
+      }
+    ),
+
+    commands.registerCommand(
+      'mago.disableRule',
+      async (category: string, ruleCode: string) => {
+        await disableRuleInConfig(category, ruleCode);
+      }
+    ),
 
     commands.registerCommand('mago.wrapWithInspect', async () => {
       const activeEditor = window.activeTextEditor;
@@ -294,7 +338,7 @@ export function activate(context: ExtensionContext) {
         return;
       }
       await wrapWithInspect(activeEditor.document, selection);
-    }),
+    })
   );
 
   // Run on save if configured
@@ -304,7 +348,10 @@ export function activate(context: ExtensionContext) {
       workspace.onDidSaveTextDocument(async (document: TextDocument) => {
         if (document.languageId === 'php' && document.uri.scheme === 'file') {
           const saveConfig = workspace.getConfiguration('mago');
-          const runOnSaveScope = saveConfig.get<string>('runOnSaveScope', 'project');
+          const runOnSaveScope = saveConfig.get<string>(
+            'runOnSaveScope',
+            'project'
+          );
           if (runOnSaveScope === 'project') {
             await scanProject();
           } else {
@@ -328,7 +375,7 @@ export function activate(context: ExtensionContext) {
 
       const config = workspace.getConfiguration('mago');
       const enableFormat = config.get<boolean>('enableFormat', true);
-      
+
       if (!enableFormat) {
         return [];
       }
@@ -338,8 +385,11 @@ export function activate(context: ExtensionContext) {
         const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
 
         // Use stdin-input for formatting the document
-        const formattedText = await runFormatCommandStdin(document.getText(), workspaceRoot);
-        
+        const formattedText = await runFormatCommandStdin(
+          document.getText(),
+          workspaceRoot
+        );
+
         if (formattedText !== document.getText()) {
           const fullRange = new Range(
             document.positionAt(0),
@@ -348,9 +398,9 @@ export function activate(context: ExtensionContext) {
           return [TextEdit.replace(fullRange, formattedText)];
         }
       } catch (error) {
-        outputChannel?.appendLine(`[ERROR] Format provider error: ${error}`);
+        log(`[ERROR] Format provider error: ${error}`);
         if (error instanceof Error) {
-          outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+          log(`[ERROR] Stack: ${error.stack}`);
         }
         // Don't show error to user, just return empty array
       }
@@ -365,24 +415,23 @@ export function activate(context: ExtensionContext) {
 
   // Register code action provider for quick fixes and source actions
   context.subscriptions.push(
-    languages.registerCodeActionsProvider(
-      'php',
-      new MagoCodeActionProvider(),
-      {
-        providedCodeActionKinds: [CodeActionKind.QuickFix, CodeActionKind.Source]
-      }
-    )
+    languages.registerCodeActionsProvider('php', new MagoCodeActionProvider(), {
+      providedCodeActionKinds: [CodeActionKind.QuickFix, CodeActionKind.Source],
+    })
   );
 
   // Register hover provider for type inspection on \Mago\inspect() calls
   context.subscriptions.push(
     languages.registerHoverProvider('php', {
-      provideHover: async (document: TextDocument, position: Position): Promise<Hover | undefined> => {
+      provideHover: async (
+        document: TextDocument,
+        position: Position
+      ): Promise<Hover | undefined> => {
         // Check if we're hovering over a \Mago\inspect( call
         const line = document.lineAt(position.line);
         const lineText = line.text;
         const cursorCol = position.character;
-        
+
         // Look for \Mago\inspect( pattern - find all matches on the line
         const inspectPattern = /\\Mago\\inspect\s*\(/g;
         const matches: Array<{ index: number; length: number }> = [];
@@ -390,52 +439,62 @@ export function activate(context: ExtensionContext) {
         while ((match = inspectPattern.exec(lineText)) !== null) {
           matches.push({ index: match.index, length: match[0].length });
         }
-        
+
         if (matches.length === 0) {
           return undefined;
         }
-        
+
         // Find the inspect call that the cursor is closest to or within
         let bestMatch: { index: number; length: number } | null = null;
         let minDistance = Infinity;
-        
+
         for (const m of matches) {
           const inspectStart = m.index;
           const inspectEnd = m.index + m.length;
-          
+
           // Check if cursor is within the inspect call (with some tolerance)
           if (cursorCol >= inspectStart - 3 && cursorCol <= inspectEnd + 100) {
-            const distance = Math.abs(cursorCol - (inspectStart + m.length / 2));
+            const distance = Math.abs(
+              cursorCol - (inspectStart + m.length / 2)
+            );
             if (distance < minDistance) {
               minDistance = distance;
               bestMatch = m;
             }
           }
         }
-        
+
         if (!bestMatch) {
           return undefined;
         }
-        
+
         const inspectStart = bestMatch.index;
         const inspectEnd = bestMatch.index + bestMatch.length;
-        
+
         // Run analyze with type-inspection for this file
         try {
           updateStatusBar('running');
           const config = workspace.getConfiguration('mago');
           const workspaceFolder = workspace.workspaceFolders?.[0];
           const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
-          
+
           // Use relative path format like ./test.php
           const filePath = document.uri.fsPath;
           const relativePath = path.relative(workspaceRoot, filePath);
-          const analyzeFile = relativePath.startsWith('..') ? filePath : `./${relativePath}`;
-          
+          const analyzeFile = relativePath.startsWith('..')
+            ? filePath
+            : `./${relativePath}`;
+
           // Run analyze with --retain-code=type-inspection
-          const analyzeArgs = ['analyze', '--retain-code=type-inspection', '--reporting-format', 'json', analyzeFile];
+          const analyzeArgs = [
+            'analyze',
+            '--retain-code=type-inspection',
+            '--reporting-format',
+            'json',
+            analyzeFile,
+          ];
           const result = await runMago(analyzeArgs);
-          
+
           if (result && result.issues) {
             // Calculate the byte offset of the hovered inspect call
             // Read the file to get accurate byte offsets (Mago uses byte offsets)
@@ -447,7 +506,7 @@ export function activate(context: ExtensionContext) {
               // Fallback to document text if file read fails
               fileContent = document.getText();
             }
-            
+
             // Calculate byte offset: get all text before the inspect call
             const lines = fileContent.split('\n');
             let byteOffset = 0;
@@ -458,28 +517,30 @@ export function activate(context: ExtensionContext) {
             const lineText = lines[position.line] || '';
             const beforeInspect = lineText.substring(0, inspectStart);
             byteOffset += Buffer.from(beforeInspect, 'utf8').length;
-            
+
             // Find the type-inspection issue that matches this specific inspect call
             // Match by comparing the Primary annotation's span.start.offset with the hovered position
             const typeInspectionIssues = result.issues.filter(
               issue => issue.code === 'type-inspection'
             );
-            
+
             let typeInspectionIssue: MagoIssue | undefined;
             let bestMatchDistance = Infinity;
-            
+
             // Match by comparing byte offsets from Primary annotation spans
             for (const issue of typeInspectionIssues) {
-              const primaryAnnotation = issue.annotations?.find(a => a.kind === 'Primary');
+              const primaryAnnotation = issue.annotations?.find(
+                a => a.kind === 'Primary'
+              );
               if (primaryAnnotation) {
                 const issueLine = primaryAnnotation.span.start.line;
                 const issueStartOffset = primaryAnnotation.span.start.offset;
-                
+
                 // First check if it's on the same line
                 if (issueLine === position.line) {
                   // Calculate distance between hovered offset and issue offset
                   const distance = Math.abs(byteOffset - issueStartOffset);
-                  
+
                   // Find the closest match (within reasonable range, e.g., 50 bytes)
                   if (distance < 50 && distance < bestMatchDistance) {
                     bestMatchDistance = distance;
@@ -488,15 +549,17 @@ export function activate(context: ExtensionContext) {
                 }
               }
             }
-            
+
             // If no match on same line, try matching by offset only (in case line numbers differ slightly)
             if (!typeInspectionIssue) {
               for (const issue of typeInspectionIssues) {
-                const primaryAnnotation = issue.annotations?.find(a => a.kind === 'Primary');
+                const primaryAnnotation = issue.annotations?.find(
+                  a => a.kind === 'Primary'
+                );
                 if (primaryAnnotation) {
                   const issueStartOffset = primaryAnnotation.span.start.offset;
                   const distance = Math.abs(byteOffset - issueStartOffset);
-                  
+
                   if (distance < 100 && distance < bestMatchDistance) {
                     bestMatchDistance = distance;
                     typeInspectionIssue = issue;
@@ -504,14 +567,17 @@ export function activate(context: ExtensionContext) {
                 }
               }
             }
-            
+
             if (typeInspectionIssue) {
               // Extract type information from annotations
               const typeInfo: string[] = [];
-              
+
               // Secondary annotations show the type information
-              const secondaryAnnotations = typeInspectionIssue.annotations?.filter(a => a.kind === 'Secondary') || [];
-              
+              const secondaryAnnotations =
+                typeInspectionIssue.annotations?.filter(
+                  a => a.kind === 'Secondary'
+                ) || [];
+
               if (secondaryAnnotations.length > 0) {
                 typeInfo.push('**Type Information:**');
                 for (const annotation of secondaryAnnotations) {
@@ -522,44 +588,52 @@ export function activate(context: ExtensionContext) {
               } else {
                 typeInfo.push('**Type Inspection Point**');
               }
-              
+
               // Add notes if available
-              if (typeInspectionIssue.notes && typeInspectionIssue.notes.length > 0) {
+              if (
+                typeInspectionIssue.notes &&
+                typeInspectionIssue.notes.length > 0
+              ) {
                 typeInfo.push('');
                 typeInfo.push('**Notes:**');
                 for (const note of typeInspectionIssue.notes) {
                   typeInfo.push(`- ${note}`);
                 }
               }
-              
+
               // Add help if available
               if (typeInspectionIssue.help) {
                 typeInfo.push('');
                 typeInfo.push(`*${typeInspectionIssue.help}*`);
               }
-              
+
               // Create hover content
               const markdown = new MarkdownString(typeInfo.join('\n'));
               markdown.isTrusted = true;
-              
+
               // Create hover range covering the inspect call
               const hoverRange = new Range(
                 new Position(position.line, inspectStart),
-                new Position(position.line, Math.min(lineText.length, inspectEnd + 20))
+                new Position(
+                  position.line,
+                  Math.min(lineText.length, inspectEnd + 20)
+                )
               );
-              
+
               return new Hover(markdown, hoverRange);
             }
           }
         } catch (error) {
-          outputChannel?.appendLine(`[ERROR] Type inspection hover error: ${error}`);
+          log(
+            `[ERROR] Type inspection hover error: ${error}`
+          );
           // Don't show error to user, just return undefined
         } finally {
           updateStatusBar('idle');
         }
-        
+
         return undefined;
-      }
+      },
     })
   );
 
@@ -567,7 +641,7 @@ export function activate(context: ExtensionContext) {
   const formatOnSave = config.get<boolean>('formatOnSave', false);
   if (formatOnSave) {
     context.subscriptions.push(
-      workspace.onWillSaveTextDocument(async (event) => {
+      workspace.onWillSaveTextDocument(async event => {
         const document = event.document;
         if (document.languageId === 'php' && document.uri.scheme === 'file') {
           event.waitUntil(formatDocument(document));
@@ -576,10 +650,55 @@ export function activate(context: ExtensionContext) {
     );
   }
 
+  // Start watch mode if configured
+  const analyzeWatchMode = config.get<boolean>('analyzeWatchMode', true);
+  const enableAnalyze = config.get<boolean>('enableAnalyze', true);
+  if (analyzeWatchMode && enableAnalyze) {
+    // Small delay to let workspace fully initialize
+    setTimeout(() => startWatchMode(), 500);
+  }
+
+  // Listen for config changes that affect watch mode
+  context.subscriptions.push(
+    workspace.onDidChangeConfiguration(e => {
+      const watchConfigKeys = [
+        'mago.analyzeWatchMode',
+        'mago.enableAnalyze',
+        'mago.binPath',
+        'mago.binCommand',
+        'mago.workspace',
+        'mago.configFile',
+        'mago.phpVersion',
+        'mago.threads',
+        'mago.useBaselines',
+        'mago.analysisBaseline',
+        'mago.minimumReportLevel',
+      ];
+      const affected = watchConfigKeys.some(key => e.affectsConfiguration(key));
+      if (affected) {
+        const updatedConfig = workspace.getConfiguration('mago');
+        const watchEnabled = updatedConfig.get<boolean>(
+          'analyzeWatchMode',
+          true
+        );
+        const analyzeEnabled = updatedConfig.get<boolean>(
+          'enableAnalyze',
+          true
+        );
+        if (watchEnabled && analyzeEnabled) {
+          restartWatchMode();
+        } else {
+          stopWatchMode();
+        }
+      }
+    })
+  );
+
   // Scan on open if configured
   const scanOnOpen = config.get<boolean>('scanOnOpen', true);
   if (scanOnOpen) {
     // Wait a bit for workspace to be fully ready, then scan
+    // Watch mode handles analyze, so scanProject will skip analyze if watch is active
     setTimeout(async () => {
       const workspaceFolder = workspace.workspaceFolders?.[0];
       if (workspaceFolder) {
@@ -596,6 +715,7 @@ export function activate(context: ExtensionContext) {
 }
 
 export function deactivate(): void {
+  stopWatchMode();
   if (runningProcess) {
     runningProcess.kill();
     runningProcess = undefined;
@@ -612,22 +732,23 @@ async function scanFile(document: TextDocument): Promise<void> {
   }
 
   updateStatusBar('running');
-  
+
   try {
     const config = workspace.getConfiguration('mago');
     const enableLint = config.get<boolean>('enableLint', true);
     const enableAnalyze = config.get<boolean>('enableAnalyze', true);
     const enableGuard = config.get<boolean>('enableGuard', false);
     const useBaselines = config.get<boolean>('useBaselines', false);
-    
-    const allIssues: MagoIssue[] = [];
-    
+
     // Run lint if enabled
     if (enableLint) {
       try {
         const lintArgs = ['lint', '--reporting-format', 'json'];
         if (useBaselines) {
-          const lintBaseline = config.get<string>('lintBaseline', 'lint-baseline.toml');
+          const lintBaseline = config.get<string>(
+            'lintBaseline',
+            'lint-baseline.toml'
+          );
           const workspaceFolder = workspace.workspaceFolders?.[0];
           const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
           const baselinePath = resolvePath(lintBaseline, workspaceRoot);
@@ -635,22 +756,25 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         lintArgs.push(document.uri.fsPath);
         const lintResult = await runMago(lintArgs);
-        if (lintResult && lintResult.issues) {
-          // Tag issues with category
-          const taggedIssues = lintResult.issues.map(issue => ({ ...issue, category: 'lint' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (lintResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'lint' as const,
+        }));
+        updateCategoryIssues('lint', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Lint failed: ${error}`);
+        log(`[WARN] Lint failed: ${error}`);
       }
     }
-    
-    // Run analyze if enabled
-    if (enableAnalyze) {
+
+    // Run analyze if enabled (skip if watch mode is active)
+    if (enableAnalyze && !watchProcess) {
       try {
         const analyzeArgs = ['analyze', '--reporting-format', 'json'];
         if (useBaselines) {
-          const analysisBaseline = config.get<string>('analysisBaseline', 'analysis-baseline.toml');
+          const analysisBaseline = config.get<string>(
+            'analysisBaseline',
+            'analysis-baseline.toml'
+          );
           const workspaceFolder = workspace.workspaceFolders?.[0];
           const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
           const baselinePath = resolvePath(analysisBaseline, workspaceRoot);
@@ -658,22 +782,25 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         analyzeArgs.push(document.uri.fsPath);
         const analyzeResult = await runMago(analyzeArgs);
-        if (analyzeResult && analyzeResult.issues) {
-          // Tag issues with category
-          const taggedIssues = analyzeResult.issues.map(issue => ({ ...issue, category: 'analysis' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (analyzeResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'analysis' as const,
+        }));
+        updateCategoryIssues('analysis', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Analyze failed: ${error}`);
+        log(`[WARN] Analyze failed: ${error}`);
       }
     }
-    
+
     // Run guard if enabled
     if (enableGuard) {
       try {
         const guardArgs = ['guard', '--reporting-format', 'json'];
         if (useBaselines) {
-          const guardBaseline = config.get<string>('guardBaseline', 'guard-baseline.toml');
+          const guardBaseline = config.get<string>(
+            'guardBaseline',
+            'guard-baseline.toml'
+          );
           const workspaceFolder = workspace.workspaceFolders?.[0];
           const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
           const baselinePath = resolvePath(guardBaseline, workspaceRoot);
@@ -681,25 +808,20 @@ async function scanFile(document: TextDocument): Promise<void> {
         }
         guardArgs.push(document.uri.fsPath);
         const guardResult = await runMago(guardArgs);
-        if (guardResult && guardResult.issues) {
-          // Tag issues with category
-          const taggedIssues = guardResult.issues.map(issue => ({ ...issue, category: 'guard' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (guardResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'guard' as const,
+        }));
+        updateCategoryIssues('guard', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Guard failed: ${error}`);
+        log(`[WARN] Guard failed: ${error}`);
       }
-    }
-    
-    // Update diagnostics with merged results (only if at least one command is enabled)
-    if (enableLint || enableAnalyze || enableGuard) {
-      updateDiagnostics({ issues: allIssues });
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to scan file - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Mago scan error: ${error}`);
+    log(`[ERROR] Mago scan error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -721,88 +843,92 @@ async function scanProject(): Promise<void> {
     const enableAnalyze = config.get<boolean>('enableAnalyze', true);
     const enableGuard = config.get<boolean>('enableGuard', false);
     const useBaselines = config.get<boolean>('useBaselines', false);
-    
-    const allIssues: MagoIssue[] = [];
-    
+
     // Run lint if enabled
     if (enableLint) {
       try {
         const lintArgs = ['lint', '--reporting-format', 'json'];
         if (useBaselines) {
-          const lintBaseline = config.get<string>('lintBaseline', 'lint-baseline.toml');
+          const lintBaseline = config.get<string>(
+            'lintBaseline',
+            'lint-baseline.toml'
+          );
           const workspaceRoot = workspaceFolder.uri.fsPath;
           const baselinePath = resolvePath(lintBaseline, workspaceRoot);
           lintArgs.push('--baseline', baselinePath);
         }
         const lintResult = await runMago(lintArgs);
-        if (lintResult && lintResult.issues) {
-          // Tag issues with category
-          const taggedIssues = lintResult.issues.map(issue => ({ ...issue, category: 'lint' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (lintResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'lint' as const,
+        }));
+        updateCategoryIssues('lint', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Lint failed: ${error}`);
+        log(`[WARN] Lint failed: ${error}`);
       }
     }
-    
-    // Run analyze if enabled
-    if (enableAnalyze) {
+
+    // Run analyze if enabled (skip if watch mode is active)
+    if (enableAnalyze && !watchProcess) {
       try {
         const analyzeArgs = ['analyze', '--reporting-format', 'json'];
         if (useBaselines) {
-          const analysisBaseline = config.get<string>('analysisBaseline', 'analysis-baseline.toml');
+          const analysisBaseline = config.get<string>(
+            'analysisBaseline',
+            'analysis-baseline.toml'
+          );
           const workspaceRoot = workspaceFolder.uri.fsPath;
           const baselinePath = resolvePath(analysisBaseline, workspaceRoot);
           analyzeArgs.push('--baseline', baselinePath);
         }
         const analyzeResult = await runMago(analyzeArgs);
-        if (analyzeResult && analyzeResult.issues) {
-          // Tag issues with category
-          const taggedIssues = analyzeResult.issues.map(issue => ({ ...issue, category: 'analysis' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (analyzeResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'analysis' as const,
+        }));
+        updateCategoryIssues('analysis', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Analyze failed: ${error}`);
+        log(`[WARN] Analyze failed: ${error}`);
       }
     }
-    
+
     // Run guard if enabled
     if (enableGuard) {
       try {
         const guardArgs = ['guard', '--reporting-format', 'json'];
         if (useBaselines) {
-          const guardBaseline = config.get<string>('guardBaseline', 'guard-baseline.toml');
+          const guardBaseline = config.get<string>(
+            'guardBaseline',
+            'guard-baseline.toml'
+          );
           const workspaceRoot = workspaceFolder.uri.fsPath;
           const baselinePath = resolvePath(guardBaseline, workspaceRoot);
           guardArgs.push('--baseline', baselinePath);
         }
         const guardResult = await runMago(guardArgs);
-        if (guardResult && guardResult.issues) {
-          // Tag issues with category
-          const taggedIssues = guardResult.issues.map(issue => ({ ...issue, category: 'guard' as const }));
-          allIssues.push(...taggedIssues);
-        }
+        const taggedIssues = (guardResult?.issues || []).map(issue => ({
+          ...issue,
+          category: 'guard' as const,
+        }));
+        updateCategoryIssues('guard', taggedIssues);
       } catch (error) {
-        outputChannel?.appendLine(`[WARN] Guard failed: ${error}`);
+        log(`[WARN] Guard failed: ${error}`);
       }
-    }
-    
-    // Update diagnostics with merged results (only if at least one command is enabled)
-    if (enableLint || enableAnalyze || enableGuard) {
-      updateDiagnostics({ issues: allIssues });
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to scan project - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Mago scan error: ${error}`);
+    log(`[ERROR] Mago scan error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
   }
 }
 
-async function lintFix(safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'): Promise<void> {
+async function lintFix(
+  safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'
+): Promise<void> {
   const workspaceFolder = workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
     window.showWarningMessage('Mago: No workspace folder open.');
@@ -832,7 +958,10 @@ async function lintFix(safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'): P
     // Use baselines if configured
     const useBaselines = config.get<boolean>('useBaselines', false);
     if (useBaselines) {
-      const lintBaseline = config.get<string>('lintBaseline', 'lint-baseline.toml');
+      const lintBaseline = config.get<string>(
+        'lintBaseline',
+        'lint-baseline.toml'
+      );
       const baselinePath = resolvePath(lintBaseline, workspaceRoot);
       lintArgs.push('--baseline', baselinePath);
     }
@@ -844,7 +973,9 @@ async function lintFix(safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'): P
       const fixesApplied = result.fixesApplied || 0;
 
       if (fixesApplied > 0) {
-        window.showInformationMessage(`Mago: Applied ${fixesApplied} fix(es) with ${safetyLevel} safety level.`);
+        window.showInformationMessage(
+          `Mago: Applied ${fixesApplied} fix(es) with ${safetyLevel} safety level.`
+        );
 
         // Re-run scan if scanOnSave is enabled (since lint fixes may have changed the code)
         const runOnSave = config.get<boolean>('runOnSave', true);
@@ -853,28 +984,35 @@ async function lintFix(safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'): P
             try {
               await scanProject();
             } catch (scanError) {
-              outputChannel?.appendLine(`[WARN] Failed to re-scan after lint fix: ${scanError}`);
+              log(
+                `[WARN] Failed to re-scan after lint fix: ${scanError}`
+              );
             }
           }, 100); // Small delay to allow UI to update
         }
       } else {
         // No fixes were applied - could be no issues found, or issues were skipped due to safety level
         // Don't show a popup message to avoid noise, but log to output channel
-        outputChannel?.appendLine(`[INFO] Lint fix completed with ${safetyLevel} safety level. No fixes were applied.`);
+        log(
+          `[INFO] Lint fix completed with ${safetyLevel} safety level. No fixes were applied.`
+        );
       }
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to apply lint fixes - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Lint fix error: ${error}`);
+    log(`[ERROR] Lint fix error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
   }
 }
 
-async function lintFixFile(document: TextDocument, safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'): Promise<void> {
+async function lintFixFile(
+  document: TextDocument,
+  safetyLevel: 'safe' | 'unsafe' | 'potentially-unsafe'
+): Promise<void> {
   if (!document.uri.fsPath.endsWith('.php')) {
     window.showWarningMessage('Mago: Can only apply lint fixes to PHP files.');
     return;
@@ -907,7 +1045,10 @@ async function lintFixFile(document: TextDocument, safetyLevel: 'safe' | 'unsafe
     // Use baselines if configured
     const useBaselines = config.get<boolean>('useBaselines', false);
     if (useBaselines) {
-      const lintBaseline = config.get<string>('lintBaseline', 'lint-baseline.toml');
+      const lintBaseline = config.get<string>(
+        'lintBaseline',
+        'lint-baseline.toml'
+      );
       const baselinePath = resolvePath(lintBaseline, workspaceRoot);
       lintArgs.push('--baseline', baselinePath);
     }
@@ -919,7 +1060,9 @@ async function lintFixFile(document: TextDocument, safetyLevel: 'safe' | 'unsafe
       const fixesApplied = result.fixesApplied || 0;
 
       if (fixesApplied > 0) {
-        window.showInformationMessage(`Mago: Applied ${fixesApplied} fix(es) to ${document.fileName} with ${safetyLevel} safety level.`);
+        window.showInformationMessage(
+          `Mago: Applied ${fixesApplied} fix(es) to ${document.fileName} with ${safetyLevel} safety level.`
+        );
 
         // Re-run scan if scanOnSave is enabled (since lint fixes may have changed the code)
         const runOnSave = config.get<boolean>('runOnSave', true);
@@ -928,21 +1071,27 @@ async function lintFixFile(document: TextDocument, safetyLevel: 'safe' | 'unsafe
             try {
               await scanFile(document);
             } catch (scanError) {
-              outputChannel?.appendLine(`[WARN] Failed to re-scan file after lint fix: ${scanError}`);
+              log(
+                `[WARN] Failed to re-scan file after lint fix: ${scanError}`
+              );
             }
           }, 100); // Small delay to allow UI to update
         }
       } else {
         // No fixes were applied - could be no issues found, or issues were skipped due to safety level
         // Don't show a popup message to avoid noise, but log to output channel
-        outputChannel?.appendLine(`[INFO] Lint fix completed on ${document.fileName} with ${safetyLevel} safety level. No fixes were applied.`);
+        log(
+          `[INFO] Lint fix completed on ${document.fileName} with ${safetyLevel} safety level. No fixes were applied.`
+        );
       }
     }
   } catch (error) {
-    window.showErrorMessage(`Mago: Failed to apply lint fixes to file - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Lint fix file error: ${error}`);
+    window.showErrorMessage(
+      `Mago: Failed to apply lint fixes to file - ${error}`
+    );
+    log(`[ERROR] Lint fix file error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -976,19 +1125,28 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
 
   // Build command - ensure we have a valid executable
   let command: string[];
-  if (binCommand && Array.isArray(binCommand) && binCommand.length > 0 && binCommand[0]) {
+  if (
+    binCommand &&
+    Array.isArray(binCommand) &&
+    binCommand.length > 0 &&
+    binCommand[0]
+  ) {
     // Filter out any empty/undefined values and resolve paths
     command = binCommand
       .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
       .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
     if (command.length === 0) {
-      throw new Error('mago.binCommand is set but contains no valid commands. Please check your settings.');
+      throw new Error(
+        'mago.binCommand is set but contains no valid commands. Please check your settings.'
+      );
     }
   } else {
     // Use binPath and resolve variables
     const path = binPath || 'mago';
     if (!path || typeof path !== 'string' || !path.trim()) {
-      throw new Error('Mago binary path is not configured. Please set mago.binPath in settings.');
+      throw new Error(
+        'Mago binary path is not configured. Please set mago.binPath in settings.'
+      );
     }
     command = [resolvePath(path.trim(), workspaceRoot)];
   }
@@ -996,43 +1154,67 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
   // Final validation
   const executable = command[0];
   if (!executable || typeof executable !== 'string' || !executable.trim()) {
-    outputChannel?.appendLine(`[ERROR] Command construction failed: ${JSON.stringify({ binPath, binCommand, command })}`);
-    throw new Error(`Invalid Mago executable: "${executable}". Please set mago.binPath in settings.`);
+    log(
+      `[ERROR] Command construction failed: ${JSON.stringify({ binPath, binCommand, command })}`
+    );
+    throw new Error(
+      `Invalid Mago executable: "${executable}". Please set mago.binPath in settings.`
+    );
   }
 
   // Build arguments: top-level options come BEFORE the subcommand
   // Structure: mago [TOP_LEVEL_OPTS] <SUBCOMMAND> [SUBCOMMAND_OPTS] [PATHS]
   // The args array already contains the subcommand (e.g., "lint") and its options
   // We need to insert top-level options BEFORE the subcommand
-  
+
   const topLevelArgs: string[] = [];
-  
+
   // Add workspace (top-level option) if not in args
-  if (!args.some(arg => arg === '--workspace' || arg.startsWith('--workspace='))) {
+  if (
+    !args.some(arg => arg === '--workspace' || arg.startsWith('--workspace='))
+  ) {
     topLevelArgs.push('--workspace', workspaceRoot);
   }
 
   // Add config file (top-level option) if specified
   const configFile = config.get<string>('configFile');
-  if (configFile && !args.some(arg => arg === '--config' || arg.startsWith('--config='))) {
+  if (
+    configFile &&
+    !args.some(arg => arg === '--config' || arg.startsWith('--config='))
+  ) {
     topLevelArgs.push('--config', configFile);
   }
 
   // Add PHP version (top-level option) if specified
   const phpVersion = config.get<string>('phpVersion');
-  if (phpVersion && !args.some(arg => arg === '--php-version' || arg.startsWith('--php-version='))) {
+  if (
+    phpVersion &&
+    !args.some(
+      arg => arg === '--php-version' || arg.startsWith('--php-version=')
+    )
+  ) {
     topLevelArgs.push('--php-version', phpVersion);
   }
 
   // Add threads (top-level option) if specified
   const threads = config.get<number>('threads');
-  if (threads && !args.some(arg => arg === '--threads' || arg.startsWith('--threads='))) {
+  if (
+    threads &&
+    !args.some(arg => arg === '--threads' || arg.startsWith('--threads='))
+  ) {
     topLevelArgs.push('--threads', threads.toString());
   }
 
   // Add minimum report level (subcommand option) if specified
   const minReportLevel = config.get<string>('minimumReportLevel', 'error');
-  if (minReportLevel && !args.some(arg => arg === '--minimum-report-level' || arg.startsWith('--minimum-report-level='))) {
+  if (
+    minReportLevel &&
+    !args.some(
+      arg =>
+        arg === '--minimum-report-level' ||
+        arg.startsWith('--minimum-report-level=')
+    )
+  ) {
     // Insert before file paths (at the end of subcommand options)
     args.push('--minimum-report-level', minReportLevel);
   }
@@ -1045,14 +1227,20 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
     // executable is already validated above, but double-check
     const executable = command[0];
     if (!executable || typeof executable !== 'string' || !executable.trim()) {
-      outputChannel?.appendLine(`[ERROR] Command validation failed: ${JSON.stringify({ binPath, binCommand, command, executable })}`);
-      reject(new Error(`Invalid Mago executable: "${executable}". Please set mago.binPath in settings.`));
+      log(
+        `[ERROR] Command validation failed: ${JSON.stringify({ binPath, binCommand, command, executable })}`
+      );
+      reject(
+        new Error(
+          `Invalid Mago executable: "${executable}". Please set mago.binPath in settings.`
+        )
+      );
       return;
     }
 
     const fullCommand = [executable, ...fullArgs].join(' ');
-    outputChannel?.appendLine(`[INFO] Running Mago: ${fullCommand}`);
-    outputChannel?.appendLine(`[INFO] Working directory: ${workspaceRoot}`);
+    log(`[INFO] Running Mago: ${fullCommand}`);
+    log(`[INFO] Working directory: ${workspaceRoot}`);
     const proc = spawn(executable, fullArgs, {
       cwd: workspaceRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1063,17 +1251,19 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout.on('data', data => {
       stdout += data.toString();
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on('data', data => {
       stderr += data.toString();
     });
 
-    proc.on('close', (code) => {
+    proc.on('close', code => {
       runningProcess = undefined;
-      outputChannel?.appendLine(`[INFO] Mago process exited with code: ${code}`);
+      log(
+        `[INFO] Mago process exited with code: ${code}`
+      );
 
       // Check if this is a fix command (which outputs human-readable messages, not JSON)
       const isFixCommand = args.includes('--fix');
@@ -1082,7 +1272,7 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
         // Handle fix command output (human-readable, not JSON)
         if (code !== 0) {
           if (stderr) {
-            outputChannel?.appendLine(`[WARN] Mago stderr: ${stderr}`);
+            log(`[WARN] Mago stderr: ${stderr}`);
           }
           reject(new Error(`Mago fix failed with exit code ${code}`));
           return;
@@ -1093,14 +1283,19 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
         const combinedOutput = (stdout + stderr).trim();
 
         if (combinedOutput.includes('Successfully applied')) {
-          const match = combinedOutput.match(/Successfully applied (\d+) fixes/);
+          const match = combinedOutput.match(
+            /Successfully applied (\d+) fixes/
+          );
           if (match) {
             fixesApplied = parseInt(match[1], 10);
           }
         } else if (combinedOutput.includes('No fixes were applied')) {
           // If it explicitly says no fixes were applied, keep fixesApplied as 0
           fixesApplied = 0;
-        } else if (combinedOutput.includes('applied') && combinedOutput.includes('fix')) {
+        } else if (
+          combinedOutput.includes('applied') &&
+          combinedOutput.includes('fix')
+        ) {
           // Check for any other indication of fixes applied
           const match = combinedOutput.match(/applied (\d+) fix/);
           if (match) {
@@ -1110,22 +1305,28 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
 
         // For fix commands, we return a result with empty issues array
         // since the fixes were applied and remaining issues would need a separate lint run
-        outputChannel?.appendLine(`[INFO] Fix command completed. Applied ${fixesApplied} fixes.`);
+        log(
+          `[INFO] Fix command completed. Applied ${fixesApplied} fixes.`
+        );
         resolve({ issues: [], fixesApplied });
         return;
       }
 
       if (code !== 0 && stderr) {
-        outputChannel?.appendLine(`[WARN] Mago stderr: ${stderr}`);
+        log(`[WARN] Mago stderr: ${stderr}`);
         // Mago may exit with non-zero on errors found, but still output JSON
         // Only reject if there's actual stderr and no valid JSON
         try {
           const result = JSON.parse(stdout);
-          outputChannel?.appendLine(`[INFO] Parsed ${result.issues?.length || 0} issues from JSON`);
+          log(
+            `[INFO] Parsed ${result.issues?.length || 0} issues from JSON`
+          );
           resolve(result);
           return;
         } catch {
-          outputChannel?.appendLine(`[ERROR] Failed to parse JSON output. stderr: ${stderr}`);
+          log(
+            `[ERROR] Failed to parse JSON output. stderr: ${stderr}`
+          );
           reject(new Error(stderr || `Mago exited with code ${code}`));
           return;
         }
@@ -1137,33 +1338,66 @@ async function runMago(args: string[]): Promise<MagoResult | null> {
         if (!result.issues) {
           result.issues = [];
         }
-        outputChannel?.appendLine(`[INFO] Parsed ${result.issues.length} issues from JSON`);
+        log(
+          `[INFO] Parsed ${result.issues.length} issues from JSON`
+        );
         resolve(result);
       } catch (error) {
         // If no JSON output, might be empty or error
         if (stdout.trim() === '' && code === 0) {
           // No issues found
-          outputChannel?.appendLine('[INFO] No issues found (empty output)');
+          log('[INFO] No issues found (empty output)');
           resolve({ issues: [] });
         } else {
-          outputChannel?.appendLine(`[ERROR] Failed to parse Mago output: ${error}`);
+          log(
+            `[ERROR] Failed to parse Mago output: ${error}`
+          );
           if (stdout) {
-            outputChannel?.appendLine(`[ERROR] stdout: ${stdout.substring(0, 500)}`);
+            log(
+              `[ERROR] stdout: ${stdout.substring(0, 500)}`
+            );
           }
           reject(new Error(`Failed to parse Mago output: ${error}`));
         }
       }
     });
 
-    proc.on('error', (error) => {
+    proc.on('error', error => {
       runningProcess = undefined;
-      outputChannel?.appendLine(`[ERROR] Failed to spawn Mago: ${error.message}`);
+      log(
+        `[ERROR] Failed to spawn Mago: ${error.message}`
+      );
       if (error.stack) {
-        outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+        log(`[ERROR] Stack: ${error.stack}`);
       }
       reject(new Error(`Failed to spawn Mago: ${error.message}`));
     });
   });
+}
+
+function updateCategoryIssues(
+  category: 'lint' | 'analysis' | 'guard',
+  issues: MagoIssue[]
+): void {
+  log(
+    `[DEBUG] updateCategoryIssues('${category}', ${issues.length} issues). Current counts: lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length}`
+  );
+  switch (category) {
+    case 'lint':
+      lintIssues = issues;
+      break;
+    case 'analysis':
+      analyzeIssues = issues;
+      break;
+    case 'guard':
+      guardIssues = issues;
+      break;
+  }
+  const allIssues = [...lintIssues, ...analyzeIssues, ...guardIssues];
+  log(
+    `[DEBUG] Merging all categories: total ${allIssues.length} issues (lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length})`
+  );
+  updateDiagnostics({ issues: allIssues });
 }
 
 function updateDiagnostics(result: MagoResult): void {
@@ -1201,7 +1435,8 @@ function updateDiagnostics(result: MagoResult): void {
     // Prefix code with category if available (lint:code, analyze:code, or guard:code)
     let diagnosticCode: string;
     if (issue.category) {
-      const categoryPrefix = issue.category === 'analysis' ? 'analyze' : issue.category;
+      const categoryPrefix =
+        issue.category === 'analysis' ? 'analyze' : issue.category;
       diagnosticCode = `${categoryPrefix}:${issue.code}`;
     } else {
       diagnosticCode = issue.code;
@@ -1210,13 +1445,15 @@ function updateDiagnostics(result: MagoResult): void {
 
     // Add help/notes as related information if available
     if (issue.help) {
-      diagnostic.relatedInformation = [{
-        location: {
-          uri: Uri.file(filePath),
-          range: range,
+      diagnostic.relatedInformation = [
+        {
+          location: {
+            uri: Uri.file(filePath),
+            range: range,
+          },
+          message: issue.help,
         },
-        message: issue.help,
-      }];
+      ];
     }
 
     // Store issue in map for code actions (key: filePath:line:col:code)
@@ -1230,12 +1467,23 @@ function updateDiagnostics(result: MagoResult): void {
     diagnosticsMap.get(filePath)!.push(diagnostic);
   }
 
-  // Update diagnostics collection
-  diagnosticCollection.clear();
+  // Update diagnostics collection with a single batch set call
+  // to avoid flicker in VSCode UI.
+  const entries: [Uri, Diagnostic[] | undefined][] = [];
+  const previousUris = new Set<string>();
+  diagnosticCollection.forEach(uri => previousUris.add(uri.toString()));
+
   for (const [filePath, diagnostics] of diagnosticsMap) {
     const uri = Uri.file(filePath);
-    diagnosticCollection.set(uri, diagnostics);
+    entries.push([uri, diagnostics]);
+    previousUris.delete(uri.toString());
   }
+
+  for (const uriStr of previousUris) {
+    entries.push([Uri.parse(uriStr), undefined]);
+  }
+
+  diagnosticCollection.set(entries);
 }
 
 // Helper to convert byte offset to column
@@ -1267,7 +1515,9 @@ function mapSeverity(level: string): DiagnosticSeverity {
   }
 }
 
-async function generateBaseline(type: 'lint' | 'analyze' | 'guard'): Promise<void> {
+async function generateBaseline(
+  type: 'lint' | 'analyze' | 'guard'
+): Promise<void> {
   const workspaceFolder = workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
     window.showWarningMessage('Mago: No workspace folder open.');
@@ -1291,35 +1541,53 @@ async function generateBaseline(type: 'lint' | 'analyze' | 'guard'): Promise<voi
         }
       }
     }
-    
+
     let baselinePath: string;
     let command: string;
     let baselineName: string;
-    
+
     if (type === 'lint') {
-      baselinePath = resolvePath(config.get<string>('lintBaseline', 'lint-baseline.toml'), workspaceRoot);
+      baselinePath = resolvePath(
+        config.get<string>('lintBaseline', 'lint-baseline.toml'),
+        workspaceRoot
+      );
       command = 'lint';
       baselineName = 'lint baseline';
     } else if (type === 'analyze') {
-      baselinePath = resolvePath(config.get<string>('analysisBaseline', 'analysis-baseline.toml'), workspaceRoot);
+      baselinePath = resolvePath(
+        config.get<string>('analysisBaseline', 'analysis-baseline.toml'),
+        workspaceRoot
+      );
       command = 'analyze';
       baselineName = 'analysis baseline';
     } else {
-      baselinePath = resolvePath(config.get<string>('guardBaseline', 'guard-baseline.toml'), workspaceRoot);
+      baselinePath = resolvePath(
+        config.get<string>('guardBaseline', 'guard-baseline.toml'),
+        workspaceRoot
+      );
       command = 'guard';
       baselineName = 'guard baseline';
     }
 
-    outputChannel?.appendLine(`[INFO] Generating ${baselineName} at: ${baselinePath}`);
-    
+    log(
+      `[INFO] Generating ${baselineName} at: ${baselinePath}`
+    );
+
     // Build command
     let execCommand: string[];
-    if (binCommand && Array.isArray(binCommand) && binCommand.length > 0 && binCommand[0]) {
+    if (
+      binCommand &&
+      Array.isArray(binCommand) &&
+      binCommand.length > 0 &&
+      binCommand[0]
+    ) {
       execCommand = binCommand
         .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
         .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
       if (execCommand.length === 0) {
-        throw new Error('mago.binCommand is set but contains no valid commands.');
+        throw new Error(
+          'mago.binCommand is set but contains no valid commands.'
+        );
       }
     } else {
       execCommand = [resolvePath(binPath.trim(), workspaceRoot)];
@@ -1327,12 +1595,14 @@ async function generateBaseline(type: 'lint' | 'analyze' | 'guard'): Promise<voi
 
     const executable = execCommand[0];
     if (!executable || typeof executable !== 'string' || !executable.trim()) {
-      throw new Error('Invalid Mago executable. Please set mago.binPath in settings.');
+      throw new Error(
+        'Invalid Mago executable. Please set mago.binPath in settings.'
+      );
     }
 
     // Build arguments
     const topLevelArgs: string[] = [];
-    
+
     // Add workspace
     topLevelArgs.push('--workspace', workspaceRoot);
 
@@ -1355,12 +1625,21 @@ async function generateBaseline(type: 'lint' | 'analyze' | 'guard'): Promise<voi
     }
 
     // Build full command: [executable] [top-level-args] [subcommand] [subcommand-args]
-    const subcommandArgs = [command, '--generate-baseline', '--baseline', baselinePath];
-    const fullArgs = [...execCommand.slice(1), ...topLevelArgs, ...subcommandArgs];
+    const subcommandArgs = [
+      command,
+      '--generate-baseline',
+      '--baseline',
+      baselinePath,
+    ];
+    const fullArgs = [
+      ...execCommand.slice(1),
+      ...topLevelArgs,
+      ...subcommandArgs,
+    ];
 
     const fullCommand = [executable, ...fullArgs].join(' ');
-    outputChannel?.appendLine(`[INFO] Running Mago: ${fullCommand}`);
-    outputChannel?.appendLine(`[INFO] Working directory: ${workspaceRoot}`);
+    log(`[INFO] Running Mago: ${fullCommand}`);
+    log(`[INFO] Working directory: ${workspaceRoot}`);
 
     // Run the command (baseline generation doesn't return JSON)
     await new Promise<void>((resolve, reject) => {
@@ -1372,42 +1651,54 @@ async function generateBaseline(type: 'lint' | 'analyze' | 'guard'): Promise<voi
       let stdout = '';
       let stderr = '';
 
-      proc.stdout.on('data', (data) => {
+      proc.stdout.on('data', data => {
         stdout += data.toString();
-        outputChannel?.appendLine(data.toString());
+        log(data.toString());
       });
 
-      proc.stderr.on('data', (data) => {
+      proc.stderr.on('data', data => {
         stderr += data.toString();
-        outputChannel?.appendLine(`[STDERR] ${data.toString()}`);
+        log(`[STDERR] ${data.toString()}`);
       });
 
-      proc.on('close', (code) => {
+      proc.on('close', code => {
         if (code !== 0) {
-          outputChannel?.appendLine(`[ERROR] Mago process exited with code: ${code}`);
+          log(
+            `[ERROR] Mago process exited with code: ${code}`
+          );
           if (stderr) {
             reject(new Error(stderr || `Mago exited with code ${code}`));
           } else {
             reject(new Error(`Mago exited with code ${code}`));
           }
         } else {
-          outputChannel?.appendLine(`[INFO] ${baselineName} generated successfully`);
+          log(
+            `[INFO] ${baselineName} generated successfully`
+          );
           resolve();
         }
       });
 
-      proc.on('error', (error) => {
-        outputChannel?.appendLine(`[ERROR] Failed to spawn Mago: ${error.message}`);
+      proc.on('error', error => {
+        log(
+          `[ERROR] Failed to spawn Mago: ${error.message}`
+        );
         reject(new Error(`Failed to spawn Mago: ${error.message}`));
       });
     });
-    
-    window.showInformationMessage(`Mago: ${baselineName} generated successfully at ${baselinePath}`);
+
+    window.showInformationMessage(
+      `Mago: ${baselineName} generated successfully at ${baselinePath}`
+    );
   } catch (error) {
-    window.showErrorMessage(`Mago: Failed to generate ${type} baseline - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Failed to generate ${type} baseline: ${error}`);
+    window.showErrorMessage(
+      `Mago: Failed to generate ${type} baseline - ${error}`
+    );
+    log(
+      `[ERROR] Failed to generate ${type} baseline: ${error}`
+    );
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -1425,7 +1716,7 @@ async function formatFile(filePath: string): Promise<void> {
   try {
     const config = workspace.getConfiguration('mago');
     const enableFormat = config.get<boolean>('enableFormat', true);
-    
+
     if (!enableFormat) {
       window.showInformationMessage('Mago: Formatting is disabled.');
       return;
@@ -1435,13 +1726,13 @@ async function formatFile(filePath: string): Promise<void> {
     const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
 
     await runFormatCommand([filePath], workspaceRoot);
-    
+
     window.showInformationMessage(`Mago: Formatted ${filePath}`);
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to format file - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Format error: ${error}`);
+    log(`[ERROR] Format error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -1458,7 +1749,7 @@ async function formatDocument(document: TextDocument): Promise<void> {
   try {
     const config = workspace.getConfiguration('mago');
     const enableFormat = config.get<boolean>('enableFormat', true);
-    
+
     if (!enableFormat) {
       return;
     }
@@ -1467,8 +1758,11 @@ async function formatDocument(document: TextDocument): Promise<void> {
     const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
 
     // Use stdin-input for formatting the document
-    const formattedText = await runFormatCommandStdin(document.getText(), workspaceRoot);
-    
+    const formattedText = await runFormatCommandStdin(
+      document.getText(),
+      workspaceRoot
+    );
+
     if (formattedText !== document.getText()) {
       const edit = new WorkspaceEdit();
       const fullRange = new Range(
@@ -1480,9 +1774,9 @@ async function formatDocument(document: TextDocument): Promise<void> {
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to format document - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Format error: ${error}`);
+    log(`[ERROR] Format error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -1501,7 +1795,7 @@ async function formatProject(): Promise<void> {
   try {
     const config = workspace.getConfiguration('mago');
     const enableFormat = config.get<boolean>('enableFormat', true);
-    
+
     if (!enableFormat) {
       window.showInformationMessage('Mago: Formatting is disabled.');
       return;
@@ -1511,13 +1805,13 @@ async function formatProject(): Promise<void> {
 
     // Format entire project (no paths = format all)
     await runFormatCommand([], workspaceRoot);
-    
+
     window.showInformationMessage('Mago: Project formatted successfully.');
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to format project - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Format error: ${error}`);
+    log(`[ERROR] Format error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
@@ -1536,7 +1830,7 @@ async function formatStaged(): Promise<void> {
   try {
     const config = workspace.getConfiguration('mago');
     const enableFormat = config.get<boolean>('enableFormat', true);
-    
+
     if (!enableFormat) {
       window.showInformationMessage('Mago: Formatting is disabled.');
       return;
@@ -1546,20 +1840,23 @@ async function formatStaged(): Promise<void> {
 
     // Use --staged flag to format staged git files
     await runFormatCommand(['--staged'], workspaceRoot);
-    
+
     window.showInformationMessage('Mago: Staged files formatted successfully.');
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to format staged files - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Format error: ${error}`);
+    log(`[ERROR] Format error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   } finally {
     updateStatusBar('idle');
   }
 }
 
-async function runFormatCommand(paths: string[], workspaceRoot: string): Promise<void> {
+async function runFormatCommand(
+  paths: string[],
+  workspaceRoot: string
+): Promise<void> {
   const config = workspace.getConfiguration('mago');
   let binPath = config.get<string>('binPath', 'mago');
   const binCommand = config.get<string[]>('binCommand');
@@ -1576,7 +1873,12 @@ async function runFormatCommand(paths: string[], workspaceRoot: string): Promise
 
   // Build command
   let execCommand: string[];
-  if (binCommand && Array.isArray(binCommand) && binCommand.length > 0 && binCommand[0]) {
+  if (
+    binCommand &&
+    Array.isArray(binCommand) &&
+    binCommand.length > 0 &&
+    binCommand[0]
+  ) {
     execCommand = binCommand
       .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
       .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
@@ -1589,12 +1891,14 @@ async function runFormatCommand(paths: string[], workspaceRoot: string): Promise
 
   const executable = execCommand[0];
   if (!executable || typeof executable !== 'string' || !executable.trim()) {
-    throw new Error('Invalid Mago executable. Please set mago.binPath in settings.');
+    throw new Error(
+      'Invalid Mago executable. Please set mago.binPath in settings.'
+    );
   }
 
   // Build arguments
   const topLevelArgs: string[] = [];
-  
+
   // Add workspace
   topLevelArgs.push('--workspace', workspaceRoot);
 
@@ -1618,11 +1922,15 @@ async function runFormatCommand(paths: string[], workspaceRoot: string): Promise
 
   // Build full command: [executable] [top-level-args] format [paths]
   const subcommandArgs = ['format', ...paths];
-  const fullArgs = [...execCommand.slice(1), ...topLevelArgs, ...subcommandArgs];
+  const fullArgs = [
+    ...execCommand.slice(1),
+    ...topLevelArgs,
+    ...subcommandArgs,
+  ];
 
   const fullCommand = [executable, ...fullArgs].join(' ');
-  outputChannel?.appendLine(`[INFO] Running Mago: ${fullCommand}`);
-  outputChannel?.appendLine(`[INFO] Working directory: ${workspaceRoot}`);
+  log(`[INFO] Running Mago: ${fullCommand}`);
+  log(`[INFO] Working directory: ${workspaceRoot}`);
 
   // Run the format command
   await new Promise<void>((resolve, reject) => {
@@ -1634,38 +1942,45 @@ async function runFormatCommand(paths: string[], workspaceRoot: string): Promise
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout.on('data', data => {
       stdout += data.toString();
-      outputChannel?.appendLine(data.toString());
+      log(data.toString());
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on('data', data => {
       stderr += data.toString();
-      outputChannel?.appendLine(`[STDERR] ${data.toString()}`);
+      log(`[STDERR] ${data.toString()}`);
     });
 
-    proc.on('close', (code) => {
+    proc.on('close', code => {
       if (code !== 0) {
-        outputChannel?.appendLine(`[ERROR] Mago process exited with code: ${code}`);
+        log(
+          `[ERROR] Mago process exited with code: ${code}`
+        );
         if (stderr) {
           reject(new Error(stderr || `Mago exited with code ${code}`));
         } else {
           reject(new Error(`Mago exited with code ${code}`));
         }
       } else {
-        outputChannel?.appendLine(`[INFO] Format completed successfully`);
+        log(`[INFO] Format completed successfully`);
         resolve();
       }
     });
 
-    proc.on('error', (error) => {
-      outputChannel?.appendLine(`[ERROR] Failed to spawn Mago: ${error.message}`);
+    proc.on('error', error => {
+      log(
+        `[ERROR] Failed to spawn Mago: ${error.message}`
+      );
       reject(new Error(`Failed to spawn Mago: ${error.message}`));
     });
   });
 }
 
-async function runFormatCommandStdin(input: string, workspaceRoot: string): Promise<string> {
+async function runFormatCommandStdin(
+  input: string,
+  workspaceRoot: string
+): Promise<string> {
   const config = workspace.getConfiguration('mago');
   let binPath = config.get<string>('binPath', 'mago');
   const binCommand = config.get<string[]>('binCommand');
@@ -1682,7 +1997,12 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
 
   // Build command
   let execCommand: string[];
-  if (binCommand && Array.isArray(binCommand) && binCommand.length > 0 && binCommand[0]) {
+  if (
+    binCommand &&
+    Array.isArray(binCommand) &&
+    binCommand.length > 0 &&
+    binCommand[0]
+  ) {
     execCommand = binCommand
       .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
       .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
@@ -1695,12 +2015,14 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
 
   const executable = execCommand[0];
   if (!executable || typeof executable !== 'string' || !executable.trim()) {
-    throw new Error('Invalid Mago executable. Please set mago.binPath in settings.');
+    throw new Error(
+      'Invalid Mago executable. Please set mago.binPath in settings.'
+    );
   }
 
   // Build arguments
   const topLevelArgs: string[] = [];
-  
+
   // Add workspace
   topLevelArgs.push('--workspace', workspaceRoot);
 
@@ -1724,11 +2046,15 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
 
   // Build full command: [executable] [top-level-args] format --stdin-input
   const subcommandArgs = ['format', '--stdin-input'];
-  const fullArgs = [...execCommand.slice(1), ...topLevelArgs, ...subcommandArgs];
+  const fullArgs = [
+    ...execCommand.slice(1),
+    ...topLevelArgs,
+    ...subcommandArgs,
+  ];
 
   const fullCommand = [executable, ...fullArgs].join(' ');
-  outputChannel?.appendLine(`[INFO] Running Mago: ${fullCommand}`);
-  outputChannel?.appendLine(`[INFO] Working directory: ${workspaceRoot}`);
+  log(`[INFO] Running Mago: ${fullCommand}`);
+  log(`[INFO] Working directory: ${workspaceRoot}`);
 
   // Run the format command with stdin input
   return new Promise<string>((resolve, reject) => {
@@ -1740,18 +2066,18 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => {
+    proc.stdout.on('data', data => {
       stdout += data.toString();
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on('data', data => {
       stderr += data.toString();
-      outputChannel?.appendLine(`[STDERR] ${data.toString()}`);
+      log(`[STDERR] ${data.toString()}`);
     });
 
     // Write input to stdin with error handling
-    proc.stdin.on('error', (error) => {
-      outputChannel?.appendLine(`[ERROR] stdin error: ${error.message}`);
+    proc.stdin.on('error', error => {
+      log(`[ERROR] stdin error: ${error.message}`);
       reject(new Error(`Failed to write to stdin: ${error.message}`));
     });
 
@@ -1759,33 +2085,363 @@ async function runFormatCommandStdin(input: string, workspaceRoot: string): Prom
       proc.stdin.write(input, 'utf8');
       proc.stdin.end();
     } catch (error) {
-      outputChannel?.appendLine(`[ERROR] Failed to write to stdin: ${error}`);
+      log(`[ERROR] Failed to write to stdin: ${error}`);
       reject(new Error(`Failed to write to stdin: ${error}`));
       return;
     }
 
-    proc.on('close', (code) => {
+    proc.on('close', code => {
       if (code !== 0) {
-        outputChannel?.appendLine(`[ERROR] Mago process exited with code: ${code}`);
+        log(
+          `[ERROR] Mago process exited with code: ${code}`
+        );
         if (stderr) {
           reject(new Error(stderr || `Mago exited with code ${code}`));
         } else {
           reject(new Error(`Mago exited with code ${code}`));
         }
       } else {
-        outputChannel?.appendLine(`[INFO] Format completed successfully`);
+        log(`[INFO] Format completed successfully`);
         resolve(stdout);
       }
     });
 
-    proc.on('error', (error) => {
-      outputChannel?.appendLine(`[ERROR] Failed to spawn Mago: ${error.message}`);
+    proc.on('error', error => {
+      log(
+        `[ERROR] Failed to spawn Mago: ${error.message}`
+      );
       reject(new Error(`Failed to spawn Mago: ${error.message}`));
     });
   });
 }
 
-function updateStatusBar(status: 'running' | 'idle' | 'error', message?: string): void {
+function buildWatchArgs(): string[] {
+  const config = workspace.getConfiguration('mago');
+  const workspaceFolder = workspace.workspaceFolders?.[0];
+  const workspaceRoot = workspaceFolder?.uri.fsPath || process.cwd();
+  const useBaselines = config.get<boolean>('useBaselines', false);
+
+  const args = ['analyze', '--watch', '--reporting-format', 'json'];
+
+  if (useBaselines) {
+    const analysisBaseline = config.get<string>(
+      'analysisBaseline',
+      'analysis-baseline.toml'
+    );
+    const baselinePath = resolvePath(analysisBaseline, workspaceRoot);
+    args.push('--baseline', baselinePath);
+  }
+
+  const minReportLevel = config.get<string>('minimumReportLevel', 'error');
+  if (minReportLevel) {
+    args.push('--minimum-report-level', minReportLevel);
+  }
+
+  return args;
+}
+
+function startWatchMode(): void {
+  if (watchProcess || watchDisabledForSession) {
+    return;
+  }
+
+  const config = workspace.getConfiguration('mago');
+  const enableAnalyze = config.get<boolean>('enableAnalyze', true);
+  const watchModeEnabled = config.get<boolean>('analyzeWatchMode', true);
+
+  if (!enableAnalyze || !watchModeEnabled) {
+    return;
+  }
+
+  const workspaceFolder = workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    return;
+  }
+
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+
+  let binPath = config.get<string>('binPath', 'mago');
+  const binCommand = config.get<string[]>('binCommand');
+
+  // Auto-discover Mago binary
+  if (!binCommand || binCommand.length === 0 || !binCommand[0]) {
+    if (!binPath || binPath.trim() === '' || binPath.trim() === 'mago') {
+      const discoveredPath = findMagoBinary(workspaceRoot);
+      if (discoveredPath) {
+        binPath = discoveredPath;
+      }
+    }
+  }
+
+  // Build command
+  let command: string[];
+  if (
+    binCommand &&
+    Array.isArray(binCommand) &&
+    binCommand.length > 0 &&
+    binCommand[0]
+  ) {
+    command = binCommand
+      .filter(cmd => cmd && typeof cmd === 'string' && cmd.trim())
+      .map(cmd => resolvePath(cmd.trim(), workspaceRoot));
+    if (command.length === 0) {
+      log(
+        '[ERROR] Watch mode: binCommand is set but contains no valid commands.'
+      );
+      return;
+    }
+  } else {
+    const resolvedPath = binPath || 'mago';
+    if (
+      !resolvedPath ||
+      typeof resolvedPath !== 'string' ||
+      !resolvedPath.trim()
+    ) {
+      log(
+        '[ERROR] Watch mode: No valid mago binary path.'
+      );
+      return;
+    }
+    command = [resolvePath(resolvedPath.trim(), workspaceRoot)];
+  }
+
+  const executable = command[0];
+  if (!executable || typeof executable !== 'string' || !executable.trim()) {
+    log('[ERROR] Watch mode: Invalid mago executable.');
+    return;
+  }
+
+  // Build top-level args
+  const topLevelArgs: string[] = [];
+  topLevelArgs.push('--workspace', workspaceRoot);
+
+  const configFile = config.get<string>('configFile');
+  if (configFile) {
+    topLevelArgs.push('--config', configFile);
+  }
+
+  const phpVersion = config.get<string>('phpVersion');
+  if (phpVersion) {
+    topLevelArgs.push('--php-version', phpVersion);
+  }
+
+  const threads = config.get<number>('threads');
+  if (threads) {
+    topLevelArgs.push('--threads', threads.toString());
+  }
+
+  const subcommandArgs = buildWatchArgs();
+  const fullArgs = [...command.slice(1), ...topLevelArgs, ...subcommandArgs];
+
+  log(
+    `[INFO] Starting watch mode: ${executable} ${fullArgs.join(' ')}`
+  );
+
+  // Reset JSON parser state
+  watchJsonBuffer = '';
+  watchBraceDepth = 0;
+  watchInString = false;
+  watchEscapeNext = false;
+  receivedJsonSinceReanalyzing = false;
+
+  let stderrLineBuffer = '';
+
+  const proc = spawn(executable, fullArgs, {
+    cwd: workspaceRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  watchProcess = proc;
+
+  proc.stdout.on('data', (data: Buffer) => {
+    const chunk = data.toString();
+    for (const char of chunk) {
+      watchJsonBuffer += char;
+
+      if (watchEscapeNext) {
+        watchEscapeNext = false;
+        continue;
+      }
+
+      if (char === '\\' && watchInString) {
+        watchEscapeNext = true;
+        continue;
+      }
+
+      if (char === '"') {
+        watchInString = !watchInString;
+        continue;
+      }
+
+      if (!watchInString) {
+        if (char === '{') {
+          watchBraceDepth++;
+        } else if (char === '}') {
+          watchBraceDepth--;
+          if (watchBraceDepth === 0) {
+            // Complete JSON document
+            try {
+              const result = JSON.parse(watchJsonBuffer);
+              log(
+                `[WATCH:parsed] Complete JSON document. Top-level keys: ${Object.keys(result).join(', ')}`
+              );
+              const issues = result.issues || [];
+              log(
+                `[WATCH:parsed] Issue count: ${issues.length}`
+              );
+              if (issues.length > 0) {
+                log(
+                  `[WATCH:parsed] First issue: ${JSON.stringify(issues[0]).substring(0, 300)}`
+                );
+              }
+              const taggedIssues = issues.map((issue: MagoIssue) => ({
+                ...issue,
+                category: 'analysis' as const,
+              }));
+              receivedJsonSinceReanalyzing = true;
+              // Cancel any pending clear timer — JSON arrived before the delay
+              if (watchClearTimer) {
+                clearTimeout(watchClearTimer);
+                watchClearTimer = undefined;
+              }
+              updateCategoryIssues('analysis', taggedIssues);
+            } catch (e) {
+              log(
+                `[ERROR] Watch mode JSON parse error: ${e}`
+              );
+              log(
+                `[ERROR] Buffer content (first 500 chars): ${watchJsonBuffer.substring(0, 500)}`
+              );
+            }
+            watchJsonBuffer = '';
+          }
+        }
+      }
+    }
+  });
+
+  proc.stderr.on('data', (data: Buffer) => {
+    stderrLineBuffer += data.toString();
+    const lines = stderrLineBuffer.split('\n');
+    // Keep the last (possibly incomplete) line in the buffer
+    stderrLineBuffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.trim()) {
+        log(`[WATCH] ${line}`);
+      }
+      if (line.includes('re-analyzing')) {
+        receivedJsonSinceReanalyzing = false;
+        updateStatusBar('running', 'Mago watch: re-analyzing...');
+      } else if (line.toLowerCase().includes('analysis complete')) {
+
+        if (!receivedJsonSinceReanalyzing) {
+          // Delay clearing to handle the race where stderr (line-buffered) arrives
+          // before stdout (pipe-buffered) has delivered the JSON data
+          if (watchClearTimer) {
+            clearTimeout(watchClearTimer);
+          }
+          watchClearTimer = setTimeout(() => {
+            watchClearTimer = undefined;
+            if (!receivedJsonSinceReanalyzing) {
+              updateCategoryIssues('analysis', []);
+            }
+          }, 200);
+        }
+        updateStatusBar('idle');
+      }
+    }
+  });
+
+  proc.on('close', code => {
+    log(`[INFO] Watch process exited with code: ${code}`);
+    watchProcess = undefined;
+
+    // Auto-restart with backoff on crash
+    if (code !== 0 && code !== null) {
+      watchFailureCount++;
+      if (watchFailureCount >= 3) {
+        watchDisabledForSession = true;
+        log(
+          '[WARN] Watch mode disabled for this session after 3 consecutive failures.'
+        );
+        window.showWarningMessage(
+          'Mago: Watch mode disabled after repeated failures. Falling back to one-shot analysis on save.'
+        );
+        updateStatusBar('error', 'Mago watch mode disabled');
+        return;
+      }
+      const delay = 5000 * watchFailureCount;
+      log(
+        `[INFO] Restarting watch mode in ${delay}ms...`
+      );
+      watchRestartTimer = setTimeout(() => {
+        startWatchMode();
+      }, delay);
+    } else {
+      // Clean exit (e.g., killed by stopWatchMode) — reset failure count
+      watchFailureCount = 0;
+    }
+  });
+
+  proc.on('error', error => {
+    log(`[ERROR] Watch process error: ${error.message}`);
+    watchProcess = undefined;
+
+    watchFailureCount++;
+    if (watchFailureCount >= 3) {
+      watchDisabledForSession = true;
+      log(
+        '[WARN] Watch mode disabled for this session after 3 consecutive failures.'
+      );
+      window.showWarningMessage(
+        'Mago: Watch mode disabled after repeated failures. Falling back to one-shot analysis on save.'
+      );
+      updateStatusBar('error', 'Mago watch mode disabled');
+      return;
+    }
+    const delay = 5000 * watchFailureCount;
+    log(`[INFO] Restarting watch mode in ${delay}ms...`);
+    watchRestartTimer = setTimeout(() => {
+      startWatchMode();
+    }, delay);
+  });
+
+  log('[INFO] Watch mode started.');
+}
+
+function stopWatchMode(): void {
+  if (watchClearTimer) {
+    clearTimeout(watchClearTimer);
+    watchClearTimer = undefined;
+  }
+  if (watchRestartTimer) {
+    clearTimeout(watchRestartTimer);
+    watchRestartTimer = undefined;
+  }
+  if (watchProcess) {
+    log('[INFO] Stopping watch mode...');
+    watchProcess.kill();
+    watchProcess = undefined;
+  }
+  // Reset parser state
+  watchJsonBuffer = '';
+  watchBraceDepth = 0;
+  watchInString = false;
+  watchEscapeNext = false;
+}
+
+function restartWatchMode(): void {
+  stopWatchMode();
+  watchFailureCount = 0;
+  watchDisabledForSession = false;
+  startWatchMode();
+}
+
+function updateStatusBar(
+  status: 'running' | 'idle' | 'error',
+  message?: string
+): void {
   if (!statusBarItem) {
     return;
   }
@@ -1818,13 +2474,17 @@ class MagoCodeActionProvider implements CodeActionProvider {
 
     // Check if text is selected - use range parameter or check active editor selection
     let hasSelection = !range.isEmpty && range.start.compareTo(range.end) !== 0;
-    
+
     // Also check active editor selection as fallback (VSCode might not pass selection in range)
     if (!hasSelection) {
       const activeEditor = window.activeTextEditor;
-      if (activeEditor && activeEditor.document.uri.toString() === document.uri.toString()) {
+      if (
+        activeEditor &&
+        activeEditor.document.uri.toString() === document.uri.toString()
+      ) {
         const selection = activeEditor.selection;
-        hasSelection = !selection.isEmpty && selection.start.compareTo(selection.end) !== 0;
+        hasSelection =
+          !selection.isEmpty && selection.start.compareTo(selection.end) !== 0;
         // Use the active selection range if available
         if (hasSelection) {
           range = new Range(selection.start, selection.end);
@@ -1833,7 +2493,11 @@ class MagoCodeActionProvider implements CodeActionProvider {
     }
 
     // Add format ignore actions when text is selected
-    if (hasSelection && document.languageId === 'php' && document.uri.scheme === 'file') {
+    if (
+      hasSelection &&
+      document.languageId === 'php' &&
+      document.uri.scheme === 'file'
+    ) {
       // Add "Add @mago-format-ignore-next" action
       const ignoreNextAction = new CodeAction(
         'Add @mago-format-ignore-next',
@@ -1909,7 +2573,7 @@ class MagoCodeActionProvider implements CodeActionProvider {
       // Use the diagnostic range's end line, as that's typically where the actual issue code is
       // The diagnostic range is calculated from the annotation span and accounts for the actual code location
       const issueLine = diagnostic.range.end.line;
-      
+
       const expectAction = new CodeAction(
         `Suppress with @mago-expect ${suppressionCode}`,
         CodeActionKind.QuickFix
@@ -1986,9 +2650,9 @@ async function applyMagoFix(issue: MagoIssue, uri: Uri): Promise<void> {
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to apply fix - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Apply fix error: ${error}`);
+    log(`[ERROR] Apply fix error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
@@ -2011,19 +2675,24 @@ async function addSuppression(
 ): Promise<void> {
   try {
     const edit = new WorkspaceEdit();
-    
+
     // Get the indentation from the line with the issue to match it
     const issueLineText = document.lineAt(line).text;
     const indentation = issueLineText.match(/^\s*/)?.[0] || '';
-    
+
     // Check if the line before the issue is a closing brace
     const prevLineNum = Math.max(0, line - 1);
     const prevLineText = document.lineAt(prevLineNum).text;
     const prevLineTrimmed = prevLineText.trim();
-    
+
     // If the previous line is just a closing brace (}, };, ], etc.), place suppression on a new line after it
-    if (prevLineTrimmed === '}' || prevLineTrimmed === '};' || prevLineTrimmed === '],' || 
-        prevLineTrimmed === ');' || prevLineTrimmed.match(/^[}\]\);,]+$/)) {
+    if (
+      prevLineTrimmed === '}' ||
+      prevLineTrimmed === '};' ||
+      prevLineTrimmed === '],' ||
+      prevLineTrimmed === ');' ||
+      prevLineTrimmed.match(/^[}\]\);,]+$/)
+    ) {
       // Insert after the closing brace, creating a new line for the suppression
       const braceEndPos = prevLineText.length;
       const position = new Position(prevLineNum, braceEndPos);
@@ -2038,9 +2707,9 @@ async function addSuppression(
       const comment = `${indentation}// @mago-expect ${suppressionCode}\n`;
       edit.insert(document.uri, position, comment);
     }
-    
+
     const applied = await workspace.applyEdit(edit);
-    
+
     if (applied) {
       window.showInformationMessage(`Mago: Added @mago-expect suppression.`);
     } else {
@@ -2048,9 +2717,9 @@ async function addSuppression(
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to add suppression - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Add suppression error: ${error}`);
+    log(`[ERROR] Add suppression error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
@@ -2060,16 +2729,21 @@ async function addFormatIgnoreFile(document: TextDocument): Promise<void> {
   try {
     const edit = new WorkspaceEdit();
     const content = document.getText();
-    
+
     // Check if file already has @mago-format-ignore
-    if (content.includes('@mago-format-ignore') || content.includes('@mago-formatter-ignore')) {
-      window.showWarningMessage('Mago: File already contains a format ignore marker.');
+    if (
+      content.includes('@mago-format-ignore') ||
+      content.includes('@mago-formatter-ignore')
+    ) {
+      window.showWarningMessage(
+        'Mago: File already contains a format ignore marker.'
+      );
       return;
     }
 
     // Find insertion point - after <?php if present, otherwise at line 0
     let insertLine = 0;
-    
+
     // Check if file starts with <?php
     if (content.trim().startsWith('<?php')) {
       // Find the line after the opening tag
@@ -2088,17 +2762,19 @@ async function addFormatIgnoreFile(document: TextDocument): Promise<void> {
 
     edit.insert(document.uri, position, comment);
     const applied = await workspace.applyEdit(edit);
-    
+
     if (applied) {
-      window.showInformationMessage('Mago: Added @mago-format-ignore (file-level).');
+      window.showInformationMessage(
+        'Mago: Added @mago-format-ignore (file-level).'
+      );
     } else {
       window.showWarningMessage('Mago: Failed to add format ignore.');
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to add format ignore - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Add format ignore error: ${error}`);
+    log(`[ERROR] Add format ignore error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
@@ -2112,17 +2788,17 @@ async function addFormatIgnoreNext(
     const edit = new WorkspaceEdit();
     // Insert on line before selection start
     const insertLine = Math.max(0, range.start.line - 1);
-    
+
     // Get indentation from selection start line
     const selectionStartLine = document.lineAt(range.start.line);
     const indentation = selectionStartLine.text.match(/^\s*/)?.[0] || '';
-    
+
     const position = new Position(insertLine, 0);
     const comment = `${indentation}// @mago-format-ignore-next\n`;
 
     edit.insert(document.uri, position, comment);
     const applied = await workspace.applyEdit(edit);
-    
+
     if (applied) {
       window.showInformationMessage('Mago: Added @mago-format-ignore-next.');
     } else {
@@ -2130,9 +2806,9 @@ async function addFormatIgnoreNext(
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to add format ignore - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Add format ignore error: ${error}`);
+    log(`[ERROR] Add format ignore error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
@@ -2144,45 +2820,54 @@ async function addFormatIgnoreRegion(
 ): Promise<void> {
   try {
     const edit = new WorkspaceEdit();
-    
+
     // Get indentation from selection start line
     const selectionStartLine = document.lineAt(range.start.line);
     const startIndentation = selectionStartLine.text.match(/^\s*/)?.[0] || '';
-    
+
     // Get indentation from selection end line (may differ)
     const selectionEndLine = document.lineAt(range.end.line);
     const endIndentation = selectionEndLine.text.match(/^\s*/)?.[0] || '';
-    
+
     // Insert start marker on line before selection
     const startLine = Math.max(0, range.start.line - 1);
     const startPosition = new Position(startLine, 0);
     const startComment = `${startIndentation}// @mago-format-ignore-start\n`;
     edit.insert(document.uri, startPosition, startComment);
-    
+
     // Insert end marker on line after selection
     const endLine = range.end.line + 1;
     const endPosition = new Position(endLine, 0);
     const endComment = `${endIndentation}// @mago-format-ignore-end\n`;
     edit.insert(document.uri, endPosition, endComment);
-    
+
     const applied = await workspace.applyEdit(edit);
-    
+
     if (applied) {
-      window.showInformationMessage('Mago: Added @mago-format-ignore-start/end region.');
+      window.showInformationMessage(
+        'Mago: Added @mago-format-ignore-start/end region.'
+      );
     } else {
       window.showWarningMessage('Mago: Failed to add format ignore region.');
     }
   } catch (error) {
-    window.showErrorMessage(`Mago: Failed to add format ignore region - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Add format ignore region error: ${error}`);
+    window.showErrorMessage(
+      `Mago: Failed to add format ignore region - ${error}`
+    );
+    log(
+      `[ERROR] Add format ignore region error: ${error}`
+    );
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
 
 // Disable rule in mago.toml configuration
-async function disableRuleInConfig(category: string, ruleCode: string): Promise<void> {
+async function disableRuleInConfig(
+  category: string,
+  ruleCode: string
+): Promise<void> {
   try {
     const workspaceFolder = workspace.workspaceFolders?.[0];
     if (!workspaceFolder) {
@@ -2209,7 +2894,9 @@ async function disableRuleInConfig(category: string, ruleCode: string): Promise<
     // Determine the target section and rule format
     const isAnalyzer = category === 'analysis';
     const targetSection = isAnalyzer ? '[analyzer]' : '[linter.rules]';
-    const ruleFormat = isAnalyzer ? `${ruleCode} = false` : `${ruleCode} = { enabled = false }`;
+    const ruleFormat = isAnalyzer
+      ? `${ruleCode} = false`
+      : `${ruleCode} = { enabled = false }`;
 
     // Find the target section
     let sectionStart = -1;
@@ -2219,14 +2906,20 @@ async function disableRuleInConfig(category: string, ruleCode: string): Promise<
       const line = lines[i].trim();
       if (line === targetSection) {
         sectionStart = i;
-      } else if (line.startsWith('[') && line.endsWith(']') && sectionStart !== -1) {
+      } else if (
+        line.startsWith('[') &&
+        line.endsWith(']') &&
+        sectionStart !== -1
+      ) {
         nextSectionStart = i;
         break;
       }
     }
 
     if (sectionStart === -1) {
-      window.showWarningMessage(`Mago: ${targetSection} section not found in mago.toml.`);
+      window.showWarningMessage(
+        `Mago: ${targetSection} section not found in mago.toml.`
+      );
       return;
     }
 
@@ -2247,7 +2940,10 @@ async function disableRuleInConfig(category: string, ruleCode: string): Promise<
     if (ruleLineIndex !== -1) {
       // Update existing rule
       const position = new Position(ruleLineIndex, 0);
-      const range = new Range(position, new Position(ruleLineIndex, lines[ruleLineIndex].length));
+      const range = new Range(
+        position,
+        new Position(ruleLineIndex, lines[ruleLineIndex].length)
+      );
       edit.replace(configUri, range, ruleFormat);
     } else {
       // Add new rule to section
@@ -2266,15 +2962,17 @@ async function disableRuleInConfig(category: string, ruleCode: string): Promise<
     const applied = await workspace.applyEdit(edit);
 
     if (applied) {
-      window.showInformationMessage(`Mago: Disabled rule '${ruleCode}' in mago.toml.`);
+      window.showInformationMessage(
+        `Mago: Disabled rule '${ruleCode}' in mago.toml.`
+      );
     } else {
       window.showWarningMessage('Mago: Failed to disable rule.');
     }
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to disable rule - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Disable rule error: ${error}`);
+    log(`[ERROR] Disable rule error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
@@ -2283,7 +2981,9 @@ async function disableRuleInConfig(category: string, ruleCode: string): Promise<
 function findMagoBinary(workspaceRoot: string): string | null {
   const vendorPath = `${workspaceRoot}/vendor/bin/mago`;
   if (fs.existsSync(vendorPath)) {
-    outputChannel?.appendLine(`[INFO] Auto-discovered Mago binary at: ${vendorPath}`);
+    log(
+      `[INFO] Auto-discovered Mago binary at: ${vendorPath}`
+    );
     return vendorPath;
   }
   return null;
@@ -2298,35 +2998,37 @@ async function wrapWithInspect(
     const edit = new WorkspaceEdit();
     const selectedText = document.getText(selection);
     const trimmedSelection = selectedText.trim();
-    
+
     // Get the line where selection ends and insert on a new line after it
     const endLine = selection.end.line;
     const endLineText = document.lineAt(endLine);
     const endLineIndent = endLineText.text.match(/^\s*/)?.[0] || '';
-    
+
     // Insert the inspect call on a new line after the selection's end line
     // This prevents breaking syntax when selection is in the middle of an expression
     const insertLine = endLine + 1;
     const insertPosition = new Position(insertLine, 0);
-    
+
     // Use the full selected expression in the inspect call
     const inspectCall = `${endLineIndent}\\Mago\\inspect(${trimmedSelection});\n`;
-    
+
     edit.insert(document.uri, insertPosition, inspectCall);
     const applied = await workspace.applyEdit(edit);
-    
+
     if (!applied) {
       window.showWarningMessage('Mago: Failed to insert inspect call.');
       return;
     }
-    
+
     // Show success message
-    window.showInformationMessage('Mago: Added \\Mago\\inspect() call. Hover over it to see type information.');
+    window.showInformationMessage(
+      'Mago: Added \\Mago\\inspect() call. Hover over it to see type information.'
+    );
   } catch (error) {
     window.showErrorMessage(`Mago: Failed to wrap with inspect - ${error}`);
-    outputChannel?.appendLine(`[ERROR] Wrap with inspect error: ${error}`);
+    log(`[ERROR] Wrap with inspect error: ${error}`);
     if (error instanceof Error) {
-      outputChannel?.appendLine(`[ERROR] Stack: ${error.stack}`);
+      log(`[ERROR] Stack: ${error.stack}`);
     }
   }
 }
