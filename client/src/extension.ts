@@ -129,6 +129,7 @@ export function activate(context: ExtensionContext) {
   statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 100);
   statusBarItem.text = '$(check) Mago';
   statusBarItem.tooltip = 'Mago';
+  statusBarItem.command = COMMANDS.SHOW_OUTPUT;
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
@@ -150,6 +151,14 @@ export function activate(context: ExtensionContext) {
     commands.registerCommand(COMMANDS.CLEAR_ERRORS, () => {
       diagnosticCollection.clear();
       updateStatusBar('idle');
+    }),
+
+    commands.registerCommand(COMMANDS.SHOW_OUTPUT, () => {
+      outputChannel?.show();
+    }),
+
+    commands.registerCommand(COMMANDS.RESTART_WATCHER, () => {
+      restartWatchMode();
     }),
 
     commands.registerCommand(COMMANDS.GENERATE_LINT_BASELINE, async () => {

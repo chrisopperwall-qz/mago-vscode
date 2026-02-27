@@ -264,6 +264,16 @@
         "command": "mago.wrapWithInspect",
         "title": "Wrap with \\Mago\\inspect",
         "category": "Mago"
+      },
+      {
+        "command": "mago.showOutput",
+        "title": "Show Output",
+        "category": "Mago"
+      },
+      {
+        "command": "mago.restartWatcher",
+        "title": "Restart Watcher",
+        "category": "Mago"
       }
     ],
     "menus": {
@@ -337,6 +347,12 @@
         {
           "command": "mago.wrapWithInspect",
           "when": "editorHasSelection && resourceExtname == .php"
+        },
+        {
+          "command": "mago.showOutput"
+        },
+        {
+          "command": "mago.restartWatcher"
         }
       ],
       "editor/context": [

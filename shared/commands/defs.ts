@@ -12,6 +12,8 @@ export const COMMANDS = {
   LINT_FIX: 'mago.lintFix',
   LINT_FIX_UNSAFE: 'mago.lintFixUnsafe',
   LINT_FIX_POTENTIALLY_UNSAFE: 'mago.lintFixPotentiallyUnsafe',
+  SHOW_OUTPUT: 'mago.showOutput',
+  RESTART_WATCHER: 'mago.restartWatcher',
 } as const;
 
 export type CommandType = typeof COMMANDS[keyof typeof COMMANDS];
