@@ -1,34 +1,34 @@
-import { COMMANDS } from '@shared/commands/defs';
-import { ChildProcess, spawn } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  CancellationToken,
-  CodeAction,
-  CodeActionContext,
-  CodeActionKind,
-  CodeActionProvider,
-  Diagnostic,
-  DiagnosticSeverity,
-  DocumentFormattingEditProvider,
   ExtensionContext,
-  FormattingOptions,
-  Hover,
-  MarkdownString,
-  OutputChannel,
-  Position,
-  Range,
+  workspace,
+  commands,
+  window,
   StatusBarAlignment,
   StatusBarItem,
-  TextDocument,
-  TextEdit,
-  Uri,
-  WorkspaceEdit,
-  commands,
   languages,
-  window,
-  workspace,
+  Diagnostic,
+  DiagnosticSeverity,
+  Range,
+  Uri,
+  TextDocument,
+  OutputChannel,
+  TextEdit,
+  WorkspaceEdit,
+  DocumentFormattingEditProvider,
+  FormattingOptions,
+  CancellationToken,
+  CodeActionProvider,
+  CodeAction,
+  CodeActionKind,
+  Position,
+  CodeActionContext,
+  MarkdownString,
+  Hover,
 } from 'vscode';
+import { COMMANDS } from '@shared/commands/defs';
 
 let diagnosticCollection = languages.createDiagnosticCollection('mago');
 let statusBarItem: StatusBarItem | undefined;
@@ -86,7 +86,7 @@ interface MagoAnnotation {
 interface MagoEdit {
   range: { start: number; end: number };
   new_text: string;
-  safety?: 'safe' | 'potentiallyunsafe' | 'unsafe';
+  safety?: "safe" | "potentiallyunsafe" | "unsafe";
 }
 
 interface MagoFileId {
@@ -1379,9 +1379,6 @@ function updateCategoryIssues(
   category: 'lint' | 'analysis' | 'guard',
   issues: MagoIssue[]
 ): void {
-  log(
-    `[DEBUG] updateCategoryIssues('${category}', ${issues.length} issues). Current counts: lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length}`
-  );
   switch (category) {
     case 'lint':
       lintIssues = issues;
@@ -1394,9 +1391,6 @@ function updateCategoryIssues(
       break;
   }
   const allIssues = [...lintIssues, ...analyzeIssues, ...guardIssues];
-  log(
-    `[DEBUG] Merging all categories: total ${allIssues.length} issues (lint=${lintIssues.length}, analyze=${analyzeIssues.length}, guard=${guardIssues.length})`
-  );
   updateDiagnostics({ issues: allIssues });
 }
 
@@ -2253,6 +2247,9 @@ function startWatchMode(): void {
 
   watchProcess = proc;
 
+  // Streaming JSON parser: mago watch outputs JSON objects separated by newlines.
+  // We parse character-by-character, tracking brace depth and string state to detect
+  // complete JSON documents without requiring newline delimiters.
   proc.stdout.on('data', (data: Buffer) => {
     const chunk = data.toString();
     for (const char of chunk) {
@@ -2279,21 +2276,10 @@ function startWatchMode(): void {
         } else if (char === '}') {
           watchBraceDepth--;
           if (watchBraceDepth === 0) {
-            // Complete JSON document
+            // Complete JSON document received
             try {
               const result = JSON.parse(watchJsonBuffer);
-              log(
-                `[WATCH:parsed] Complete JSON document. Top-level keys: ${Object.keys(result).join(', ')}`
-              );
               const issues = result.issues || [];
-              log(
-                `[WATCH:parsed] Issue count: ${issues.length}`
-              );
-              if (issues.length > 0) {
-                log(
-                  `[WATCH:parsed] First issue: ${JSON.stringify(issues[0]).substring(0, 300)}`
-                );
-              }
               const taggedIssues = issues.map((issue: MagoIssue) => ({
                 ...issue,
                 category: 'analysis' as const,
@@ -2306,12 +2292,7 @@ function startWatchMode(): void {
               }
               updateCategoryIssues('analysis', taggedIssues);
             } catch (e) {
-              log(
-                `[ERROR] Watch mode JSON parse error: ${e}`
-              );
-              log(
-                `[ERROR] Buffer content (first 500 chars): ${watchJsonBuffer.substring(0, 500)}`
-              );
+              log(`[ERROR] Watch mode JSON parse error: ${e}`);
             }
             watchJsonBuffer = '';
           }
