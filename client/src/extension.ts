@@ -703,26 +703,31 @@ export function activate(context: ExtensionContext) {
     })
   );
 
-  // Watch for changes to mago.toml (or configured config file) and restart watcher
+  // Watch for changes to mago config and baseline files, restart watcher and re-scan
   const configFileName = config.get<string>('configFile') || 'mago.toml';
-  const configFileWatcher = workspace.createFileSystemWatcher(
-    `**/${configFileName}`
-  );
-  const onConfigFileChanged = () => {
-    log(`[INFO] Config file ${configFileName} changed, restarting...`);
-    const updatedConfig = workspace.getConfiguration('mago');
-    const watchEnabled = updatedConfig.get<boolean>('analyzeWatchMode', true);
-    const analyzeEnabled = updatedConfig.get<boolean>('enableAnalyze', true);
-    if (watchEnabled && analyzeEnabled) {
-      restartWatchMode();
-    }
-    // Re-scan project to pick up config changes for lint/guard
-    scanProject();
-  };
-  configFileWatcher.onDidChange(onConfigFileChanged);
-  configFileWatcher.onDidCreate(onConfigFileChanged);
-  configFileWatcher.onDidDelete(onConfigFileChanged);
-  context.subscriptions.push(configFileWatcher);
+  const lintBaseline = config.get<string>('lintBaseline', 'lint-baseline.toml');
+  const analysisBaseline = config.get<string>('analysisBaseline', 'analysis-baseline.toml');
+  const guardBaseline = config.get<string>('guardBaseline', 'guard-baseline.toml');
+  const watchedFiles = [configFileName, lintBaseline, analysisBaseline, guardBaseline];
+  const fileWatchers = watchedFiles.map(fileName => {
+    const watcher = workspace.createFileSystemWatcher(`**/${fileName}`);
+    const onFileChanged = () => {
+      log(`[INFO] ${fileName} changed, restarting...`);
+      const updatedConfig = workspace.getConfiguration('mago');
+      const watchEnabled = updatedConfig.get<boolean>('analyzeWatchMode', true);
+      const analyzeEnabled = updatedConfig.get<boolean>('enableAnalyze', true);
+      if (watchEnabled && analyzeEnabled) {
+        restartWatchMode();
+      }
+      // Re-scan project to pick up changes for lint/guard
+      scanProject();
+    };
+    watcher.onDidChange(onFileChanged);
+    watcher.onDidCreate(onFileChanged);
+    watcher.onDidDelete(onFileChanged);
+    return watcher;
+  });
+  fileWatchers.forEach(w => context.subscriptions.push(w));
 
   // Scan on open if configured
   const scanOnOpen = config.get<boolean>('scanOnOpen', true);
